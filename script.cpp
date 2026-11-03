@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <functional>
+#include <map>
+#include <algorithm>
 
 using namespace std;
 
@@ -97,6 +99,24 @@ struct PerfectHorseOriginalStats
 	int bonusRanks[4];
 };
 static vector<PerfectHorseOriginalStats> g_perfectHorseOriginalStats;
+
+// ---------------------------------------------------------------------------
+// [HorseCustomStats]
+// Per-breed base stats read from the .ini (Health|Stamina|Speed|Acceleration).
+// If the section is missing/empty the map stays empty and every horse keeps
+// its original stats. Values are clamped to [kHorseStatMin, kHorseStatMax].
+// ---------------------------------------------------------------------------
+static const int kHorseStatMin = 1;
+static const int kHorseStatMax = 7;
+
+struct HorseCustomStats
+{
+	int health;
+	int stamina;
+	int speed;
+	int acceleration;
+};
+static map<DWORD, HorseCustomStats> g_horseModelStats; // model hash -> custom stats
 
 int g_activeStableIndex = -1;
 
@@ -331,12 +351,45 @@ static void RestorePerfectHorseStats(Ped horse)
 
 static void HideApocalypseHorseEquipment(Ped horse);
 
+static bool GetCustomHorseStats(Ped horse, HorseCustomStats &out)
+{
+	if (g_horseModelStats.empty()) return false;
+	map<DWORD, HorseCustomStats>::const_iterator it = g_horseModelStats.find((DWORD)ENTITY::GET_ENTITY_MODEL(horse));
+	if (it == g_horseModelStats.end()) return false;
+	out = it->second;
+	return true;
+}
+
+// Applies the stats a horse should have, in this priority order:
+//   1) Apocalypse "PerfectHorses" (model + equipment match)
+//   2) [HorseCustomStats] for the horse's breed
+//   3) Original stats (restored if they had been changed before)
 static void ApplyPerfectHorseStats(Ped horse)
 {
-	if (g_perfectHorses == 0 || !IsApocalypseHorseWithEquipment(horse))
+	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return;
+
+	int targetHealth = 0, targetStamina = 0, targetSpeed = 0, targetAcceleration = 0;
+	bool isApocalypse = (g_perfectHorses != 0 && IsApocalypseHorseWithEquipment(horse));
+
+	if (isApocalypse)
 	{
-		RestorePerfectHorseStats(horse);
-		return;
+		targetHealth = g_perfectHorsesHealth;
+		targetStamina = g_perfectHorsesStamina;
+		targetSpeed = g_perfectHorsesSpeed;
+		targetAcceleration = g_perfectHorsesAcceleration;
+	}
+	else
+	{
+		HorseCustomStats custom;
+		if (!GetCustomHorseStats(horse, custom))
+		{
+			RestorePerfectHorseStats(horse);
+			return;
+		}
+		targetHealth = custom.health;
+		targetStamina = custom.stamina;
+		targetSpeed = custom.speed;
+		targetAcceleration = custom.acceleration;
 	}
 
 	const int attributes[] = { 0, 1, 5, 6 };
@@ -352,6 +405,13 @@ static void ApplyPerfectHorseStats(Ped horse)
 
 	if (!hasOriginalStats)
 	{
+		// Drop bookkeeping for horses that no longer exist so the list doesn't grow forever.
+		for (size_t i = g_perfectHorseOriginalStats.size(); i-- > 0;)
+		{
+			if (!ENTITY::DOES_ENTITY_EXIST(g_perfectHorseOriginalStats[i].horse))
+				g_perfectHorseOriginalStats.erase(g_perfectHorseOriginalStats.begin() + i);
+		}
+
 		PerfectHorseOriginalStats originalStats;
 		originalStats.horse = horse;
 		for (int i = 0; i < 4; i++)
@@ -365,20 +425,21 @@ static void ApplyPerfectHorseStats(Ped horse)
 	int bonding = (int)ATTRIBUTE::_0xA4C8E23E29040DE0(horse, 7);
 	if (bonding < 1) bonding = 1;
 	int maxBase = 10 - bonding;
-	int health = g_perfectHorsesHealth;
-	int stamina = g_perfectHorsesStamina;
+	int health = targetHealth;
+	int stamina = targetStamina;
 	if (health > maxBase) health = maxBase;
 	if (stamina > maxBase) stamina = maxBase;
 
 	ATTRIBUTE::_0x5DA12E025D47D4E5(horse, 0, health);
 	ATTRIBUTE::_0x5DA12E025D47D4E5(horse, 1, stamina);
-	ATTRIBUTE::_0x5DA12E025D47D4E5(horse, 5, g_perfectHorsesSpeed);
-	ATTRIBUTE::_0x5DA12E025D47D4E5(horse, 6, g_perfectHorsesAcceleration);
+	ATTRIBUTE::_0x5DA12E025D47D4E5(horse, 5, targetSpeed);
+	ATTRIBUTE::_0x5DA12E025D47D4E5(horse, 6, targetAcceleration);
 
-	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 5, (float)g_perfectHorsesSpeed, FALSE);
-	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 6, (float)g_perfectHorsesAcceleration, FALSE);
+	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 5, (float)targetSpeed, FALSE);
+	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 6, (float)targetAcceleration, FALSE);
 
-	HideApocalypseHorseEquipment(horse);
+	if (isApocalypse)
+		HideApocalypseHorseEquipment(horse);
 }
 
 static void HideApocalypseHorseEquipment(Ped horse)
@@ -835,12 +896,156 @@ static void LoadKeysFromIni(const string &iniPath)
 }
 
 
+static string UpperCopy(string s)
+{
+	for (size_t i = 0; i < s.size(); i++) s[i] = (char)toupper((unsigned char)s[i]);
+	return s;
+}
+
+// Known horse coat models. Used to map a model hash back to its breed
+// (the game has no native for that). Any extra horse model that appears in the
+// .ini ([Spawn] / stables) is registered automatically as well.
+static const char *kKnownHorseModels[] = {
+	"A_C_HORSE_AMERICANPAINT_GREYOVERO", "A_C_HORSE_AMERICANPAINT_OVERO", "A_C_HORSE_AMERICANPAINT_SPLASHEDWHITE", "A_C_HORSE_AMERICANPAINT_TOBIANO",
+	"A_C_HORSE_AMERICANSTANDARDBRED_BLACK", "A_C_HORSE_AMERICANSTANDARDBRED_BUCKSKIN", "A_C_HORSE_AMERICANSTANDARDBRED_LIGHTBUCKSKIN", "A_C_HORSE_AMERICANSTANDARDBRED_PALOMINODAPPLE", "A_C_HORSE_AMERICANSTANDARDBRED_SILVERTAILBUCKSKIN",
+	"A_C_HORSE_ANDALUSIAN_DARKBAY", "A_C_HORSE_ANDALUSIAN_PERLINO", "A_C_HORSE_ANDALUSIAN_ROSEGRAY",
+	"A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE", "A_C_HORSE_APPALOOSA_BLANKET", "A_C_HORSE_APPALOOSA_BROWNLEOPARD", "A_C_HORSE_APPALOOSA_FEWSPOTTED_PC", "A_C_HORSE_APPALOOSA_LEOPARD", "A_C_HORSE_APPALOOSA_LEOPARDBLANKET",
+	"A_C_HORSE_ARABIAN_BLACK", "A_C_HORSE_ARABIAN_GREY", "A_C_HORSE_ARABIAN_REDCHESTNUT", "A_C_HORSE_ARABIAN_REDCHESTNUT_PC", "A_C_HORSE_ARABIAN_ROSEGREYBAY", "A_C_HORSE_ARABIAN_WARPEDBRINDLE_PC", "A_C_HORSE_ARABIAN_WHITE",
+	"A_C_HORSE_ARDENNES_BAYROAN", "A_C_HORSE_ARDENNES_IRONGREYROAN", "A_C_HORSE_ARDENNES_STRAWBERRYROAN",
+	"A_C_HORSE_BELGIAN_BLONDCHESTNUT", "A_C_HORSE_BELGIAN_MEALYCHESTNUT",
+	"A_C_HORSE_BRETON_GRULLODUN", "A_C_HORSE_BRETON_MEALYBAY", "A_C_HORSE_BRETON_REDROAN", "A_C_HORSE_BRETON_SEALBROWN", "A_C_HORSE_BRETON_SORREL", "A_C_HORSE_BRETON_STEELGREY",
+	"A_C_HORSE_CRIOLLO_BAYBRINDLE", "A_C_HORSE_CRIOLLO_BAYFRAMEOVERO", "A_C_HORSE_CRIOLLO_BLUEROANOVERO", "A_C_HORSE_CRIOLLO_DUN", "A_C_HORSE_CRIOLLO_MARBLEDSABINO", "A_C_HORSE_CRIOLLO_SORREL",
+	"A_C_HORSE_DUTCHWARMBLOOD_CHOCOLATEROAN", "A_C_HORSE_DUTCHWARMBLOOD_SEALBROWN", "A_C_HORSE_DUTCHWARMBLOOD_SOOTYBUCKSKIN",
+	"A_C_HORSE_GYPSYCOB_BLACKPINTO", "A_C_HORSE_GYPSYCOB_BLUEROANOVERO", "A_C_HORSE_GYPSYCOB_DAPPLEBAY", "A_C_HORSE_GYPSYCOB_PALOMINOBLAGDON", "A_C_HORSE_GYPSYCOB_PIEBALD", "A_C_HORSE_GYPSYCOB_SKEWBALD", "A_C_HORSE_GYPSYCOB_WHITEBLAGDON",
+	"A_C_HORSE_HUNGARIANHALFBRED_DARKDAPPLEGREY", "A_C_HORSE_HUNGARIANHALFBRED_FLAXENCHESTNUT", "A_C_HORSE_HUNGARIANHALFBRED_LIVERCHESTNUT", "A_C_HORSE_HUNGARIANHALFBRED_PIEBALDTOBIANO",
+	"A_C_HORSE_KENTUCKYSADDLE_BLACK", "A_C_HORSE_KENTUCKYSADDLE_BUTTERMILKBUCKSKIN_PC", "A_C_HORSE_KENTUCKYSADDLE_CHESTNUTPINTO", "A_C_HORSE_KENTUCKYSADDLE_GREY", "A_C_HORSE_KENTUCKYSADDLE_SILVERBAY",
+	"A_C_HORSE_KLADRUBER_BLACK", "A_C_HORSE_KLADRUBER_CREMELLO", "A_C_HORSE_KLADRUBER_DAPPLEGREY", "A_C_HORSE_KLADRUBER_GREY", "A_C_HORSE_KLADRUBER_SILVER", "A_C_HORSE_KLADRUBER_WHITE",
+	"A_C_HORSE_MISSOURIFOXTROTTER_AMBERCHAMPAGNE", "A_C_HORSE_MISSOURIFOXTROTTER_BLACKTOVERO", "A_C_HORSE_MISSOURIFOXTROTTER_BLUEROAN", "A_C_HORSE_MISSOURIFOXTROTTER_BUCKSKINBRINDLE", "A_C_HORSE_MISSOURIFOXTROTTER_DAPPLEGREY", "A_C_HORSE_MISSOURIFOXTROTTER_SABLECHAMPAGNE",
+	"A_C_HORSE_MORGAN_BAY", "A_C_HORSE_MORGAN_BAYROAN", "A_C_HORSE_MORGAN_FLAXENCHESTNUT", "A_C_HORSE_MORGAN_LIVERCHESTNUT", "A_C_HORSE_MORGAN_PALOMINO",
+	"A_C_HORSE_MUSTANG_BLACKOVERO", "A_C_HORSE_MUSTANG_BUCKSKIN", "A_C_HORSE_MUSTANG_CHESTNUTTOVERO", "A_C_HORSE_MUSTANG_GRULLODUN", "A_C_HORSE_MUSTANG_REDDUNOVERO", "A_C_HORSE_MUSTANG_TIGERSTRIPEDBAY", "A_C_HORSE_MUSTANG_WILDBAY",
+	"A_C_HORSE_NOKOTA_BLUEROAN", "A_C_HORSE_NOKOTA_REVERSEDAPPLEROAN", "A_C_HORSE_NOKOTA_WHITEROAN",
+	"A_C_HORSE_NORFOLKROADSTER_BLACK", "A_C_HORSE_NORFOLKROADSTER_DAPPLEDBUCKSKIN", "A_C_HORSE_NORFOLKROADSTER_PIEBALDROAN", "A_C_HORSE_NORFOLKROADSTER_ROSEGREY", "A_C_HORSE_NORFOLKROADSTER_SPECKLEDGREY", "A_C_HORSE_NORFOLKROADSTER_SPOTTEDTRICOLOR",
+	"A_C_HORSE_SHIRE_BLACK", "A_C_HORSE_SHIRE_DARKBAY", "A_C_HORSE_SHIRE_EBONY", "A_C_HORSE_SHIRE_RAVENBLACK",
+	"A_C_HORSE_SUFFOLKPUNCH_REDCHESTNUT", "A_C_HORSE_SUFFOLKPUNCH_SORREL",
+	"A_C_HORSE_TENNESSEEWALKER_BLACKRABICANO", "A_C_HORSE_TENNESSEEWALKER_CHESTNUT", "A_C_HORSE_TENNESSEEWALKER_DAPPLEBAY", "A_C_HORSE_TENNESSEEWALKER_FLAXENROAN", "A_C_HORSE_TENNESSEEWALKER_MAHOGANYBAY", "A_C_HORSE_TENNESSEEWALKER_REDROAN", "A_C_HORSE_TENNESSEEWALKER_GOLDPALOMINO_PC",
+	"A_C_HORSE_THOROUGHBRED_BLACKCHESTNUT", "A_C_HORSE_THOROUGHBRED_BRINDLE", "A_C_HORSE_THOROUGHBRED_DAPPLEGREY", "A_C_HORSE_THOROUGHBRED_REVERSEDAPPLEBLACK",
+	"A_C_HORSE_TURKOMAN_BLACK", "A_C_HORSE_TURKOMAN_CHESTNUT", "A_C_HORSE_TURKOMAN_DARKBAY", "A_C_HORSE_TURKOMAN_GOLD", "A_C_HORSE_TURKOMAN_GREY", "A_C_HORSE_TURKOMAN_PERLINO", "A_C_HORSE_TURKOMAN_SILVER",
+	"A_C_HORSE_MURFREEBROOD_MANGE_01", "A_C_HORSE_MURFREEBROOD_MANGE_02", "A_C_HORSE_MURFREEBROOD_MANGE_03"
+};
+
+// Reads the [HorseCustomStats] section:
+//   BREED_<NAME>=Health|Stamina|Speed|Acceleration
+// and builds g_horseModelStats (model hash -> stats). Removing the section
+// leaves g_horseModelStats empty, so every horse keeps its original stats.
+static void LoadHorseCustomStats(const string &iniPath)
+{
+	g_horseModelStats.clear();
+
+	map<string, HorseCustomStats> breeds; // "ARABIAN" -> stats
+
+	ifstream file(iniPath);
+	if (!file.is_open()) return;
+
+	bool inSection = false;
+	string line;
+	while (getline(file, line))
+	{
+		line = Trim(line);
+		if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+
+		if (line[0] == '[')
+		{
+			size_t close = line.find(']');
+			inSection = (close != string::npos)
+				&& UpperCopy(Trim(line.substr(1, close - 1))) == "HORSECUSTOMSTATS";
+			continue;
+		}
+		if (!inSection) continue;
+
+		size_t eq = line.find('=');
+		if (eq == string::npos) continue;
+
+		string key = UpperCopy(Trim(line.substr(0, eq)));
+		string val = Trim(line.substr(eq + 1));
+
+		size_t comment = val.find(';');
+		if (comment != string::npos) val = Trim(val.substr(0, comment));
+
+		if (key.compare(0, 6, "BREED_") == 0) key = key.substr(6);
+		if (key.empty()) continue;
+
+		int v[4];
+		int n = 0;
+		stringstream ss(val);
+		string field;
+		while (n < 4 && getline(ss, field, '|'))
+		{
+			field = Trim(field);
+			if (field.empty()) break;
+			int num = atoi(field.c_str());
+			if (num < kHorseStatMin) num = kHorseStatMin;
+			if (num > kHorseStatMax) num = kHorseStatMax;
+			v[n++] = num;
+		}
+		if (n != 4) continue; // malformed line -> ignore this breed
+
+		HorseCustomStats st;
+		st.health = v[0];
+		st.stamina = v[1];
+		st.speed = v[2];
+		st.acceleration = v[3];
+		breeds[key] = st;
+	}
+	file.close();
+
+	if (breeds.empty()) return;
+
+	auto registerModel = [&](const string &modelName)
+	{
+		string up = UpperCopy(Trim(modelName));
+		static const string prefix = "A_C_HORSE_";
+		if (up.size() <= prefix.size() || up.compare(0, prefix.size(), prefix) != 0) return;
+		string rest = up.substr(prefix.size());
+
+		// Longest breed name that is a whole-word prefix of the model name.
+		const HorseCustomStats *best = nullptr;
+		size_t bestLen = 0;
+		for (map<string, HorseCustomStats>::const_iterator it = breeds.begin(); it != breeds.end(); ++it)
+		{
+			const string &name = it->first;
+			if (name.size() <= bestLen || rest.size() < name.size()) continue;
+			if (rest.compare(0, name.size(), name) != 0) continue;
+			if (rest.size() != name.size() && rest[name.size()] != '_') continue;
+			best = &it->second;
+			bestLen = name.size();
+		}
+		if (!best) return;
+
+		DWORD hash = GAMEPLAY::GET_HASH_KEY(const_cast<char *>(up.c_str()));
+		g_horseModelStats[hash] = *best;
+	};
+
+	for (size_t i = 0; i < sizeof(kKnownHorseModels) / sizeof(kKnownHorseModels[0]); i++)
+		registerModel(kKnownHorseModels[i]);
+
+	// Models referenced by the .ini itself (covers coats missing from the list above).
+	for (size_t i = 0; i < g_startSpawns.size(); i++)
+		registerModel(g_startSpawns[i].model);
+	for (size_t i = 0; i < g_stables.size(); i++)
+		for (size_t j = 0; j < g_stables[i].horses.size(); j++)
+			registerModel(g_stables[i].horses[j].model);
+}
+
+
 static void LoadConfig()
 {
 	string iniPath = GetIniPath();
 
 	if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+	{
+		g_horseModelStats.clear();
 		return;
+	}
 
 	LoadKeysFromIni(iniPath);
 
@@ -939,7 +1144,11 @@ static void LoadConfig()
 	g_markers.clear();
 
 	ifstream file(iniPath);
-	if (!file.is_open()) return;
+	if (!file.is_open())
+	{
+		g_horseModelStats.clear();
+		return;
+	}
 
 	StableZone *currentStable = nullptr;
 	bool inSpawnSection = false;
@@ -1333,6 +1542,9 @@ static void LoadConfig()
 	}
 
 	file.close();
+
+	// Per-breed custom stats (after spawns/stables so their models can be registered too).
+	LoadHorseCustomStats(iniPath);
 }
 
 static void FadeAndSpawn(const function<void()> &spawnFunc, MenuBase *menu)
