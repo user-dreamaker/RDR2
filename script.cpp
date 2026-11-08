@@ -48,15 +48,7 @@ int g_perfectHorsesStamina = 0;
 int g_perfectHorsesSpeed = 0;
 int g_perfectHorsesAcceleration = 0;
 
-// A horse only receives the Apocalypse boost when its model matches AND every
-// configured equipment slot (Saddle, SaddleBag, Stirrup, Horn, Blanket, Bedroll)
-// that has hashes configured is actually equipped with one of those hashes.
-// Hashes are kept grouped by slot (instead of one flat list) so that, e.g., a
-// Saddle hash can only ever satisfy the Saddle requirement, never "borrow" a
-// pass from a completely different slot (SaddleBag/Stirrup/Horn/Blanket/Bedroll)
-// that happens to already be correctly equipped.
-static const int kApocalypseEquipmentTypeCount = 6; // Saddle, SaddleBag, Stirrup, Horn, Blanket, Bedroll
-
+// Apocalypse horses: boost by breed+model (+gender +nickname).
 struct ApocalypseModelInfo
 {
 	DWORD modelHash = 0;
@@ -65,24 +57,8 @@ struct ApocalypseModelInfo
 struct ApocalypseHorseEntry
 {
 	vector<ApocalypseModelInfo> models;
-	vector<DWORD> equipmentHashesByType[kApocalypseEquipmentTypeCount];
-	bool equipmentHidden[kApocalypseEquipmentTypeCount] = {};
-	// Accepted horse names ("nicknames"). Empty = no name requirement (the horse is valid on model+gender+equipment).
+	// Accepted horse names ("nicknames"). Empty = no name requirement.
 	vector<string> requiredNames;
-
-	bool HasAnyEquipment() const
-	{
-		for (int i = 0; i < kApocalypseEquipmentTypeCount; i++)
-			if (!equipmentHashesByType[i].empty()) return true;
-		return false;
-	}
-
-	bool HasAnyHiddenEquipment() const
-	{
-		for (int i = 0; i < kApocalypseEquipmentTypeCount; i++)
-			if (equipmentHidden[i] && !equipmentHashesByType[i].empty()) return true;
-		return false;
-	}
 
 	bool MatchesModel(DWORD modelHash) const
 	{
@@ -246,7 +222,7 @@ static void ClearSpawnedPeds()
 }
 
 static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse);   // defined with the stable-record helpers below
-static bool IsApocalypseHorseWithEquipment(Ped horse)
+static bool IsApocalypseHorse(Ped horse)
 {
 	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
 
@@ -265,56 +241,7 @@ static bool IsApocalypseHorseWithEquipment(Ped horse)
 			if (horseGender != genderRequired) continue;
 		}
 
-		// Equipment is only a gate when at least one item is configured for this entry.
-		// Entries configured with no equipment at all (the four horsemen) qualify on breed+gender (+nickname) alone.
-		if (entry.HasAnyEquipment())
-		{
-			int numComponents = PED::_0x90403E8107B60E81(horse);
-			if (numComponents <= 0 || numComponents >= 100) continue;
-
-			// Track, per equipment slot type, whether we found a currently equipped
-			// item whose hash matches one of the hashes configured for THAT slot.
-			bool matchedType[kApocalypseEquipmentTypeCount] = { false };
-
-			// A matched piece of equipment must belong to the SAME slot type it
-			// was configured under - a Saddle hash can never satisfy the Stirrup
-			// requirement. Slots configured with nothing stay out of the check.
-			for (int idx = 0; idx < numComponents; idx++)
-			{
-				DWORD out1 = 0, out2 = 0;
-				Any shopItemHash = PED::_0x77BA37622E22023B(horse, idx, FALSE, &out1, &out2);
-				if (shopItemHash == 0) continue;
-
-				for (int t = 0; t < kApocalypseEquipmentTypeCount; t++)
-				{
-					const vector<DWORD> &hashes = entry.equipmentHashesByType[t];
-					for (size_t j = 0; j < hashes.size(); j++)
-					{
-						if (shopItemHash == hashes[j])
-						{
-							matchedType[t] = true;
-							break;
-						}
-					}
-				}
-			}
-
-			// Every slot type that has hashes configured must have found a match
-			// among the horse's currently equipped items. If even one configured
-			// slot (e.g. Saddle) never matched, the horse doesn't qualify - even if
-			// every other slot happened to already be correct.
-			bool allConfiguredTypesMatched = true;
-			for (int t = 0; t < kApocalypseEquipmentTypeCount; t++)
-			{
-				if (!entry.equipmentHashesByType[t].empty() && !matchedType[t])
-				{
-					allConfiguredTypesMatched = false;
-					break;
-				}
-			}
-			if (!allConfiguredTypesMatched) continue;
-		}
-
+		// No equipment requirement: breed+model (+gender +nickname) alone.
 		if (!PedNicknameMatches(entry, horse)) continue;
 		return true;
 	}
@@ -343,11 +270,9 @@ static void RestorePerfectHorseStats(Ped horse)
 	}
 }
 
-static void HideApocalypseHorseEquipment(Ped horse);
-
 static void ApplyPerfectHorseStats(Ped horse)
 {
-	if (g_perfectHorses == 0 || !IsApocalypseHorseWithEquipment(horse))
+	if (g_perfectHorses == 0 || !IsApocalypseHorse(horse))
 	{
 		RestorePerfectHorseStats(horse);
 		return;
@@ -391,39 +316,15 @@ static void ApplyPerfectHorseStats(Ped horse)
 
 	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 5, (float)g_perfectHorsesSpeed, FALSE);
 	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 6, (float)g_perfectHorsesAcceleration, FALSE);
-
-	HideApocalypseHorseEquipment(horse);
 }
 
-static void HideApocalypseHorseEquipment(Ped horse)
+// Was this ped boosted by ApplyPerfectHorseStats earlier? (used to restore vanilla SP horses,
+// which have no table stats to fall back to)
+static bool IsPerfectHorseBoosted(Ped horse)
 {
-	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return;
-
-	DWORD modelHash = ENTITY::GET_ENTITY_MODEL(horse);
-
-	for (size_t i = 0; i < g_apocalypseHorses.size(); i++)
-	{
-		const ApocalypseHorseEntry &entry = g_apocalypseHorses[i];
-		if (!entry.MatchesModel(modelHash) || !entry.HasAnyHiddenEquipment()) continue;
-
-		static const DWORD kEquipmentCategoryHashes[kApocalypseEquipmentTypeCount] = {
-			0xBAA7E618,
-			0x80451C25,
-			0xDA6DADCA,
-			0x05447332,
-			0x17CEB41A,
-			0xEFB31921
-		};
-
-		for (int t = 0; t < kApocalypseEquipmentTypeCount; t++)
-		{
-			if (!entry.equipmentHidden[t]) continue;
-			PED::_0xD710A5007C2AC539(horse, kEquipmentCategoryHashes[t], FALSE);
-		}
-
-		PED::_0xCC8CA3E88256E58F(horse, FALSE, TRUE, TRUE, TRUE, FALSE);
-		return;
-	}
+	for (size_t i = 0; i < g_perfectHorseOriginalStats.size(); i++)
+		if (g_perfectHorseOriginalStats[i].horse == horse) return true;
+	return false;
 }
 
 static Ped SpawnOneHorse(const SpawnEntry &s)
@@ -829,8 +730,7 @@ static void LoadKeysFromIni(const string &iniPath)
 		}
 	}
 
-	const char *apocalypseHorseNames[] = { "Death", "Famine", "Pestilence", "War", "LowProfile", "Boar", "Alligator", "Bear", "Beaver", "Panther", "Cougar", "Rattlesnake" };
-	const char *equipmentTypes[] = { "Saddle", "SaddleBag", "Stirrup", "Horn", "Blanket", "Bedroll" };
+	const char *apocalypseHorseNames[] = { "Death", "Famine", "Pestilence", "War" };
 	for (size_t i = 0; i < sizeof(apocalypseHorseNames) / sizeof(apocalypseHorseNames[0]); i++)
 	{
 		string horseKey = string(apocalypseHorseNames[i]) + "Horse";
@@ -865,38 +765,12 @@ static void LoadKeysFromIni(const string &iniPath)
 			mi.genderRequired = genderRequired;
 			entry.models.push_back(mi);
 		}
-		// The four horsemen only grant the boost with the right breed+gender AND the right nickname.
-		// Everybody else (LowProfile, Boar, ...) keeps model+gender+equipment with NO nickname requirement.
-		if (horseKey == "DeathHorse") entry.requiredNames = vector<string>{ "Death", "Death Horse" };
-		else if (horseKey == "FamineHorse") entry.requiredNames = vector<string>{ "Famine", "Famine Horse" };
-		else if (horseKey == "PestilenceHorse") entry.requiredNames = vector<string>{ "Pestilence", "Pestilence Horse" };
-		else if (horseKey == "WarHorse") entry.requiredNames = vector<string>{ "War", "War Horse" };
+		// The four horsemen grant the boost with the right breed+model AND the right nickname.
+		if (horseKey == "DeathHorse") entry.requiredNames = vector<string>{ "Death", "Death Horse", "Morte" };
+		else if (horseKey == "FamineHorse") entry.requiredNames = vector<string>{ "Famine", "Famine Horse", "Fome" };
+		else if (horseKey == "PestilenceHorse") entry.requiredNames = vector<string>{ "Pestilence", "Pestilence Horse", "Peste" };
+		else if (horseKey == "WarHorse") entry.requiredNames = vector<string>{ "War", "War Horse", "Guerra" };
 		if (entry.models.empty()) continue;
-		for (size_t j = 0; j < sizeof(equipmentTypes) / sizeof(equipmentTypes[0]) && j < (size_t)kApocalypseEquipmentTypeCount; j++)
-		{
-			string equipmentKey = string(apocalypseHorseNames[i]) + equipmentTypes[j];
-			char equipmentBuf[2048];
-			GetPrivateProfileStringA("ApocalypseHorses", equipmentKey.c_str(), "", equipmentBuf, sizeof(equipmentBuf), iniPath.c_str());
-
-			stringstream equipmentStream(equipmentBuf);
-			string equipmentHash;
-			while (getline(equipmentStream, equipmentHash, ','))
-			{
-				string token = Trim(equipmentHash);
-				if (token.empty()) continue;
-				if (token.size() > 2 && token[token.size() - 1] == '0'
-					&& token[token.size() - 2] == ':')
-				{
-					entry.equipmentHidden[j] = true;
-					token = token.substr(0, token.size() - 2);
-				}
-				DWORD hash = (DWORD)strtoul(token.c_str(), nullptr, 0);
-				if (hash != 0) entry.equipmentHashesByType[j].push_back(hash);
-			}
-		}
-
-		// Push every entry: the equipment gate (when equipment IS configured) is enforced in
-		// IsApocalypseHorseWithEquipment; entries with no equipment (the four horsemen) qualify on breed+gender+nickname.
 		g_apocalypseHorses.push_back(entry);
 	}
 }
@@ -2734,38 +2608,6 @@ void main()
 								compHashes[compCount++] = (DWORD)shopItemHash;
 						}
 
-						const char *eqTypeNames[] = { "Saddle", "SaddleBag", "Stirrup", "Horn", "Blanket", "Bedroll" };
-						for (int t = 0; t < kApocalypseEquipmentTypeCount; t++)
-						{
-							for (int c = 0; c < compCount; c++)
-							{
-								bool matched = false;
-								for (size_t h = 0; h < g_apocalypseHorses.size() && !matched; h++)
-								{
-									const vector<DWORD> &hashes = g_apocalypseHorses[h].equipmentHashesByType[t];
-									for (size_t j = 0; j < hashes.size(); j++)
-									{
-										if (compHashes[c] == hashes[j])
-										{
-											matched = true;
-											break;
-										}
-									}
-								}
-								if (matched)
-								{
-									char eqLine[256];
-									sprintf_s(eqLine, "%s: 0x%08X", eqTypeNames[t], compHashes[c]);
-									UI::SET_TEXT_SCALE(0.0, 0.35f);
-									UI::SET_TEXT_COLOR_RGBA(255, 1, 1, 128);
-									UI::SET_TEXT_DROPSHADOW(0, 0, 0, 0, 0);
-									UI::SET_TEXT_CENTRE(1);
-									DrawText(0.5f, lineY * 0.01f, eqLine);
-									lineY += 3;
-									break;
-								}
-							}
-						}
 					}
 				}
 
@@ -2973,7 +2815,6 @@ void main()
 			RADAR::_SET_MINIMAP_REVEALED(TRUE);
 
 		// Perfect Horses: apply or restore stats on the player's mount and nearby mod-spawned horses.
-		// This always runs so a boost is removed immediately after changing equipment.
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
 			if (ENTITY::DOES_ENTITY_EXIST(playerPed))
@@ -3516,7 +3357,7 @@ static const char *kOnlineModels[] = {
 };
 
 // Donor families (SP horses; hashes from the reference log).
-enum Family { D_MANGE1 = 0, D_MANGE2, D_MANGE3, D_BUELL, F_COUNT };
+enum Family { DONOR_1 = 0, DONOR_2, DONOR_3, DONOR_4, F_COUNT };
 struct Donor { const char *name; uint32_t breed, model; };
 static const Donor kDonors[F_COUNT] = {
 	// Murfreebrood "mange" horses: known to the stable tables (breed/class/coat) and never legit stable horses
@@ -3524,13 +3365,13 @@ static const Donor kDonors[F_COUNT] = {
 	{ "MURFREE_MANGE_01",   0xF1F348C6, 0x36AE742C },
 	{ "MURFREE_MANGE_02",   0xFFE664AC, 0xC97A99C6 },
 	{ "MURFREE_MANGE_03",   0xC5B77047, 0xDC4D3F6B },
-	{ "BUELL_WARVET",       0x5E2548B3, 0x20C6D093 },
+	{ "TENNESSEEWALKER_CHESTNUT", 0xCC41EF1A, 0x400B3937 },
 };
 
 static int FamilyOf(const char *name)
 {
 	// Only the three Murfree mange donors are used now.
-	return D_MANGE1;
+	return DONOR_1;
 }
 // Breed hash = joaat("BREED_" + model name without "A_C_HORSE_") (verified on the reference log).
 static uint32_t BreedOf(const char *model)
@@ -3872,9 +3713,9 @@ static void RenameNewlyAcquired()
 	}
 }
 // ---- conversion: Online horse record -> SP donor --------------------------
-// A donor whose model is also a normal story horse that the player owns as a REAL horse (e.g. BUELL_WARVET bought
-// at a stable) is ambiguous: a ped with that model can be the donor stand-in or the real horse, and the stable HUD
-// would label one with the other's identity. Such a donor is never handed out.
+// A donor whose model is also a normal story horse that the player owns as a REAL horse (e.g. the Tennessee Walker
+// Chestnut bought at a stable) is ambiguous: a ped with that model can be the donor stand-in or the real horse,
+// and the stable HUD would label one with the other's identity. Such a donor is never handed out.
 static bool DonorModelOwnedByRealHorse(int d)
 {
 	for (int i = 0; i < kSlots; i++)
@@ -3912,8 +3753,8 @@ static void ConvertOnlineSlots()
 		int pick = -1;
 		for (int d = 0; d < F_COUNT && pick < 0; d++)
 			if (g_map[d].valid && g_map[d].realModel == s.model && !DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;
-		for (int d = D_MANGE1; d <= D_MANGE3 && pick < 0; d++) if (!DonorInUse(d, i)) pick = d;   // preferred donors: the three Murfreebrood models
-		for (int d = 0; d < F_COUNT && pick < 0; d++) if (!DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;   // last resort: BUELL_WARVET
+		for (int d = DONOR_1; d <= DONOR_3 && pick < 0; d++) if (!DonorInUse(d, i)) pick = d;   // preferred donors: the three Murfreebrood models
+		for (int d = 0; d < F_COUNT && pick < 0; d++) if (!DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;   // last resort: the Tennessee Walker Chestnut
 		if (pick < 0) { continue; }
 
 		if (g_dryRun) continue;
@@ -4405,14 +4246,33 @@ static int FindSlotForPed(Ped horse)
 		SlotInfo s = ReadSlot(i);
 		if (s.ok && s.state != 0 && SlotPed(i) == horse) return i;
 	}
-	// fallback: the horsemen models are unique per slot anyway, so the model hash is unambiguous
+	// fallback by model. An Online horse near a stable has the SP donor pair in its record (donor mode), so the
+	// record's model is the donor's, not the ped's real Online model: the donor map says which real horse each donor
+	// stands for. Without this the nickname of an Online horse could not be found while donors were on, and the
+	// Apocalypse boost was silently dropped (and came back later) - "sometimes no boost".
 	DWORD m = ENTITY::GET_ENTITY_MODEL(horse);
+	int matches[kSlots]; int nm = 0;
 	for (int i = 0; i < kSlots; i++)
 	{
 		SlotInfo s = ReadSlot(i);
-		if (s.ok && s.state != 0 && s.model == m) return i;
+		if (!s.ok || s.state == 0) continue;
+		bool match = (s.model == m);
+		if (!match)
+		{
+			int d = DonorOfPair(s.breed, s.model);
+			if (d >= 0 && g_map[d].valid && g_map[d].realModel == m) match = true;
+		}
+		if (match && nm < kSlots) matches[nm++] = i;
 	}
-	return -1;
+	if (nm == 0) return -1;
+	if (nm > 1)
+	{
+		// several horses of the same model: the one the player rides is the active horse (slot 0)
+		Ped player = PLAYER::PLAYER_PED_ID();
+		if (ENTITY::DOES_ENTITY_EXIST(player) && PED::GET_MOUNT(player) == horse)
+			for (int k = 0; k < nm; k++) if (matches[k] == 0) return 0;
+	}
+	return matches[0];
 }
 static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse)
 {
@@ -4469,7 +4329,7 @@ static bool IsKnownHorseModel(uint32_t pm)
 	return false;
 }
 // Is the donor pair of donor d currently held by a persistent slot? (a ped with a donor's model is only a donor
-// stand-in while some slot really holds that donor pair - otherwise it is a normal horse, e.g. a bought Buell)
+// stand-in while some slot really holds that donor pair - otherwise it is a normal horse, e.g. a bought Tennessee Walker Chestnut)
 static bool DonorHeld(int d)
 {
 	if (d < 0 || d >= F_COUNT) return false;
@@ -4603,7 +4463,7 @@ static void ApplyStableHud(bool inMenu)
 		Ped ped = (Ped)pedList[i];
 		if (ped == player || !ENTITY::DOES_ENTITY_EXIST(ped)) continue;
 		uint32_t pm = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
-		// _IS_THIS_MODEL_A_HORSE, but our donors (MURFREE mange / Buell) and Online models are always accepted -
+		// _IS_THIS_MODEL_A_HORSE, but our donors (MURFREE mange / Tennessee Walker Chestnut) and Online models are always accepted -
 		// the game may not class the donor stand-ins as horses, which left the 4th horse without Type/Breed/Coat.
 		if (!IsKnownHorseModel(pm) && !invoke<BOOL>(0x772A1969F649E902ull, (Hash)pm)) continue;
 		Vector3 p = ENTITY::GET_ENTITY_COORDS(ped, TRUE, TRUE);
@@ -4708,7 +4568,9 @@ static void ApplyStableHudSafe(bool inMenu)
 	}
 }
 
-// Real stats: set the base ranks on every nearby Online horse ped (UI bars and gameplay read them).
+// Real stats: set the base ranks on every nearby horse ped (UI bars and gameplay read them).
+// Online horses get the table ranks; any horse that qualifies for the Apocalypse boost - Online OR vanilla SP
+// (e.g. the horse on display in the stable scene) - gets THAT boost instead.
 static bool g_stats = true;
 static void ApplyOnlineStats()
 {
@@ -4724,6 +4586,23 @@ static void ApplyOnlineStats()
 	{
 		Ped ped = (Ped)buf[i + 1];
 		if (!ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped)) continue;
+		// A horse that qualifies for the Apocalypse boost (PerfectHorses) gets THAT boost, never the table values:
+		// this loop used to reset the base ranks to the table every 500 ms while the main loop re-applied the boost
+		// every frame, so the two fought and the boost was there only part of the time.
+		// Online OR vanilla SP: vanilla horses used to be skipped entirely here, so the boost never showed in the
+		// stable for them (the stable scene ped is not the player's mount, so the main loop never reached it).
+		if (g_perfectHorses != 0 && IsApocalypseHorse(ped))
+		{
+			ApplyPerfectHorseStats(ped);
+			continue;
+		}
+		// A vanilla SP horse we boosted earlier that no longer qualifies (renamed, or PerfectHorses turned off):
+		// restore its original ranks. Online horses are covered by the table-stats write below; vanilla ones are not.
+		if (IsPerfectHorseBoosted(ped))
+		{
+			ApplyPerfectHorseStats(ped);   // not qualifying anymore: restores the saved original ranks
+			continue;
+		}
 		const OnlineModel *om = FindOnline((uint32_t)ENTITY::GET_ENTITY_MODEL(ped));
 		if (!om) continue;
 		const HorseStat *st = StatsFor(om->name);
