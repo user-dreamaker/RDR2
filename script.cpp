@@ -40,7 +40,7 @@ int g_fog_of_War = 0;
 int g_scanner = 0;
 int g_kmh = 0;
 int g_clear_All_Bounties_and_Lockdown_Areas = 0;
-int g_autoRename = 1;   // 1 = rename a brand-new horse once, to its real breed in the game's language (never over an existing name); 0 = never rename
+int g_autoRename = 0;
 
 int g_perfectHorses = 0;
 int g_perfectHorsesHealth = 0;
@@ -48,7 +48,6 @@ int g_perfectHorsesStamina = 0;
 int g_perfectHorsesSpeed = 0;
 int g_perfectHorsesAcceleration = 0;
 
-// Apocalypse horses: boost by breed+model (+gender +nickname).
 struct ApocalypseModelInfo
 {
 	DWORD modelHash = 0;
@@ -57,7 +56,6 @@ struct ApocalypseModelInfo
 struct ApocalypseHorseEntry
 {
 	vector<ApocalypseModelInfo> models;
-	// Accepted horse names ("nicknames"). Empty = no name requirement.
 	vector<string> requiredNames;
 
 	bool MatchesModel(DWORD modelHash) const
@@ -163,7 +161,6 @@ static Ped g_lastPlayerPed = 0;
 static float g_lastPlayerX = 0, g_lastPlayerY = 0;
 static bool g_hasLastPlayerPos = false;
 
-// Cash cheat feature
 static vector<string> g_bankPhrases;
 static DWORD  g_bankModelHash = 0;
 static float  g_bankRange     = 2.5f;
@@ -174,7 +171,6 @@ static DWORD        g_bankStateTick   = 0;
 static bool         g_bankF2Held      = false;
 static bool         g_pasteWasDownBK     = false;
 
-// Daily limit tracking for $500 cash cheat (per phrase)
 static vector<string> g_bankPhraseDates;
 static const int CASH_CHEAT_AMOUNT = 50000; // $500 in cents
 
@@ -187,7 +183,6 @@ static string GetWindowsDate()
 	return string(buf);
 }
 
-// Outfit unlock feature
 static DWORD  g_outfitNpcHash = 0;
 static vector<string> g_outfitPhrases;
 static float  g_outfitRange = 3.0f;
@@ -221,12 +216,14 @@ static void ClearSpawnedPeds()
 	if (mount != 0) g_spawnedPeds.push_back({ SpawnEntry(), mount, 0, 0, 0, true, true, true, 0 });
 }
 
-static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse);   // defined with the stable-record helpers below
+static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse);
+static DWORD ResolveApocalypseHorseModel(Ped horse, DWORD visibleModel);
 static bool IsApocalypseHorse(Ped horse)
 {
 	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
 
-	DWORD modelHash = ENTITY::GET_ENTITY_MODEL(horse);
+	DWORD visibleModel = ENTITY::GET_ENTITY_MODEL(horse);
+	DWORD modelHash = ResolveApocalypseHorseModel(horse, visibleModel);
 
 	for (size_t i = 0; i < g_apocalypseHorses.size(); i++)
 	{
@@ -240,8 +237,6 @@ static bool IsApocalypseHorse(Ped horse)
 			int horseGender = (exprValue < 0.5f) ? 1 : 0;
 			if (horseGender != genderRequired) continue;
 		}
-
-		// No equipment requirement: breed+model (+gender +nickname) alone.
 		if (!PedNicknameMatches(entry, horse)) continue;
 		return true;
 	}
@@ -316,15 +311,6 @@ static void ApplyPerfectHorseStats(Ped horse)
 
 	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 5, (float)g_perfectHorsesSpeed, FALSE);
 	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 6, (float)g_perfectHorsesAcceleration, FALSE);
-}
-
-// Was this ped boosted by ApplyPerfectHorseStats earlier? (used to restore vanilla SP horses,
-// which have no table stats to fall back to)
-static bool IsPerfectHorseBoosted(Ped horse)
-{
-	for (size_t i = 0; i < g_perfectHorseOriginalStats.size(); i++)
-		if (g_perfectHorseOriginalStats[i].horse == horse) return true;
-	return false;
 }
 
 static Ped SpawnOneHorse(const SpawnEntry &s)
@@ -457,7 +443,6 @@ static int GiveCashToPlayer(int phraseIndex)
 
 	g_bankPhraseDates[phraseIndex] = today;
 
-	// Save to INI
 	SaveCheatLog(phraseIndex, today);
 
 	return 0;
@@ -575,10 +560,6 @@ static int GetStableAtPlayerPos()
 	return -1;
 }
 
-// Wider, position-based stable approach detector. The normal interaction detector
-// above intentionally uses a very small prompt radius; donor conversion must begin
-// earlier, before the stable camera takes over, but must never be triggered by an
-// unrelated scripted camera elsewhere in the world.
 static int GetStableApproachAtPlayerPos(float activationRadius)
 {
 	Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -687,12 +668,7 @@ static void LoadKeysFromIni(const string &iniPath)
 	g_kmh = GetPrivateProfileIntA("Config", "KMH", 0, iniPath.c_str());
 	g_clear_All_Bounties_and_Lockdown_Areas = GetPrivateProfileIntA("Config", "Clear_All_Bounties_and_Lockdown_Areas", 0, iniPath.c_str());
 
-	// AutoRename: 1 (default) renames a brand-new Online horse ONCE, to its REAL breed's label in the game's language -
-	// never overwriting an existing name, including the game's default PLAYER_HORSE_NAME_DEFAULT ("Meu Cavalo"/"My Horse"). 0: never renames.
-	g_autoRename = GetPrivateProfileIntA("Config", "AutoRename", 1, iniPath.c_str());
-	// Parse ApocalypseHorses configuration.
-	// PerfectHorses format: Health:7|Stamina:7|Speed:7|Acceleration:7|1
-	// The last value enables (1) or disables (0) the feature.
+	g_autoRename = GetPrivateProfileIntA("Config", "AutoRename", 0, iniPath.c_str());
 	g_perfectHorses = 0;
 	g_perfectHorsesHealth = 0;
 	g_perfectHorsesStamina = 0;
@@ -765,7 +741,6 @@ static void LoadKeysFromIni(const string &iniPath)
 			mi.genderRequired = genderRequired;
 			entry.models.push_back(mi);
 		}
-		// The four horsemen grant the boost with the right breed+model AND the right nickname.
 		if (horseKey == "DeathHorse") entry.requiredNames = vector<string>{ "Death", "Death Horse", "Morte" };
 		else if (horseKey == "FamineHorse") entry.requiredNames = vector<string>{ "Famine", "Famine Horse", "Fome" };
 		else if (horseKey == "PestilenceHorse") entry.requiredNames = vector<string>{ "Pestilence", "Pestilence Horse", "Peste" };
@@ -791,7 +766,6 @@ static void LoadConfig()
 	g_outfitNpcHash = 0;
 	g_outfitPhrases.clear();
 
-	// Hardcoded cheat configuration (embedded to prevent player exploitation via ini)
 	g_bankModelHash = 0x40C51B9B;
 	g_bankPhrases.push_back("GREED IS NOW A VIRTUE");
 	g_bankPhrases.push_back("THE ROOT OF ALL EVIL, WE THANK YOU!");
@@ -800,7 +774,6 @@ static void LoadConfig()
 	g_outfitNpcHash = 0x2AE5771F;
 	g_outfitPhrases.push_back("VANITY. ALL IS VANITY");
 
-	// Load saved cheat log dates from INI
 	for (size_t i = 0; i < g_bankPhrases.size(); i++)
 	{
 		char key[32];
@@ -839,8 +812,6 @@ static void LoadConfig()
 			if (tonicsVal == "1") enabled = true;
 		}
 
-		// Tonics=0|... (or the key missing) means the tonic shop is OFF: nothing is registered, so the F2 menu
-		// never opens next to the trapper. Only Tonics=1|<price> (or Tonics=1) switches it on.
 		if (enabled)
 		{
 		TonicEntry t1;
@@ -1549,7 +1520,6 @@ public:
 	}
 };
 
-// the tonic shop is on only when the ini has Tonics=1|... and at least one tonic is enabled
 static bool TonicShopEnabled()
 {
 	if (!g_tonicsConfigLoaded) return false;
@@ -1663,11 +1633,9 @@ static void CreateMarkerBlips()
 	ClearMarkerBlips();
 	if (g_markers.empty()) return;
 
-	// Request both blip texture dictionaries
 	TEXTURE::REQUEST_STREAMED_TEXTURE_DICT("blips", FALSE);
 	TEXTURE::REQUEST_STREAMED_TEXTURE_DICT("blips_mp", FALSE);
 
-	// Wait up to ~50 frames for textures to load
 	for (int w = 0; w < 50; w++)
 	{
 		if (TEXTURE::HAS_STREAMED_TEXTURE_DICT_LOADED("blips") &&
@@ -1733,7 +1701,6 @@ void main()
 
 	while (true)
 	{
-		// Refresh: reload the .ini and re-apply changes
 		{
 			static bool refreshHeld = false;
 			bool refreshDown = g_refreshKey != 0 && (GetAsyncKeyState(g_refreshKey) & 0x8000) != 0;
@@ -1763,7 +1730,6 @@ void main()
 			refreshHeld = refreshDown;
 		}
 
-		// Bank state machine
 		if (!g_bankPhrases.empty())
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -2018,7 +1984,6 @@ void main()
 			}
 		}
 
-		// Outfit unlock state machine
 		if (!g_outfitPhrases.empty())
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -2324,7 +2289,6 @@ void main()
 				}
 			}
 		}
-		// Detect world-ready / map (session) change to (re)trigger spawns
 		bool worldReady = false;
 		{
 			Player player = PLAYER::PLAYER_ID();
@@ -2356,7 +2320,6 @@ void main()
 			}
 		}
 
-		// Initial spawns (once per session / after refresh)
 		{
 			if (worldReady && !g_spawnsDone && !g_startSpawns.empty())
 			{
@@ -2401,7 +2364,6 @@ void main()
 			}
 		}
 
-		// Create map markers (once per session) — hidden by default
 		{
 			if (worldReady && !g_markersCreated && !g_markers.empty())
 			{
@@ -2418,7 +2380,6 @@ void main()
 			}
 		}
 
-		// 
 		if (!g_spawnedPeds.empty())
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -2508,7 +2469,6 @@ void main()
 			}
 		}
 
-		// Scanner overlay
 		if (g_scanner != 0 && (PLAYER::IS_PLAYER_TARGETTING_ANYTHING(PLAYER::PLAYER_ID()) || PLAYER::IS_PLAYER_FREE_AIMING(PLAYER::PLAYER_ID())))
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -2523,7 +2483,6 @@ void main()
 				Vector3 aimPos = {0,0,0};
 				float aimHeading = 0.0f;
 
-				// Raycast from camera
 				Vector3 camPos = CAM::GET_GAMEPLAY_CAM_COORD();
 				Vector3 camRot = CAM::GET_GAMEPLAY_CAM_ROT(2);
 				float rz = camRot.z * 0.017453292f;
@@ -2558,7 +2517,6 @@ void main()
 					}
 				}
 
-				// Fallback: look for nearby ped matching bank model hash
 				if (aimHash == 0 && g_bankModelHash != 0)
 				{
 					Vector3 pPos = ENTITY::GET_ENTITY_COORDS(playerPed, TRUE, TRUE);
@@ -2582,7 +2540,6 @@ void main()
 					}
 				}
 
-				// Line 1: ped
 				char pedLine[128];
 				sprintf_s(pedLine, "0x%08X=X:%.0f;Y:%.0f;Z:%.0f;W:%.0f", pedHash, pedPos.x, pedPos.y, pedPos.z, pedHeading);
 				UI::SET_TEXT_SCALE(0.0, 0.35f);
@@ -2611,14 +2568,12 @@ void main()
 					}
 				}
 
-				// Line 2+: container + items
 				if (aimHash != 0)
 				{
 					Hash containerHash = 0;
 					Vector3 containerPos = {0,0,0};
 					float containerHeading = 0.0f;
 
-					// Find the container: different object near the aimed object
 					int nearArr[256];
 					int nearCount = worldGetAllObjects(nearArr, 256);
 					for (int i = 0; i < nearCount && i < 256; i++)
@@ -2640,7 +2595,6 @@ void main()
 						}
 					}
 
-					// Line 2: container (or aimed object if no container found)
 					if (containerHash != 0)
 					{
 						char cLine[128];
@@ -2653,7 +2607,6 @@ void main()
 						lineY += 3;
 					}
 
-					// Lines 3+: aimed object + other items near container
 					Vector3 searchPos = containerHash != 0 ? containerPos : aimPos;
 					for (int i = 0; i < nearCount && i < 256; i++)
 					{
@@ -2678,8 +2631,7 @@ void main()
 				}
 			}
 		}
-		
-		// FPS overlay
+
 		if (g_fps != 0)
 		{
 			static DWORD fpsLastTick = GetTickCount();
@@ -2711,7 +2663,6 @@ void main()
 			DrawText(0.01f, 0.01f, fpsBuf);
 		}
 
-		// GPS coords overlay
 		if (g_gps != 0)
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -2731,7 +2682,6 @@ void main()
 			}
 		}
 
-		// KMH speed monitor (bottom right, only when mounted)
 		if (g_kmh != 0)
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -2754,7 +2704,6 @@ void main()
 			}
 		}
 
-		// Clear All Bounties and Lockdown Areas (Arthur with Bandana)
 		if (g_clear_All_Bounties_and_Lockdown_Areas != 0)
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -2810,23 +2759,19 @@ void main()
 			SniperHook_SetDisguised(false);
 		}
 
-		// Fog of War
 		if (g_fog_of_War != 0)
 			RADAR::_SET_MINIMAP_REVEALED(TRUE);
 
-		// Perfect Horses: apply or restore stats on the player's mount and nearby mod-spawned horses.
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
 			if (ENTITY::DOES_ENTITY_EXIST(playerPed))
 			{
-				// Apply to player's current mount
 				Ped mount = PED::GET_MOUNT(playerPed);
 				if (mount != 0 && ENTITY::DOES_ENTITY_EXIST(mount) && !ENTITY::IS_ENTITY_DEAD(mount))
 				{
 					ApplyPerfectHorseStats(mount);
 				}
 
-				// Apply to nearby mod-spawned horses
 				Vector3 ppos = ENTITY::GET_ENTITY_COORDS(playerPed, TRUE, TRUE);
 				for (size_t i = 0; i < g_spawnedPeds.size(); i++)
 				{
@@ -2844,7 +2789,6 @@ void main()
 			}
 		}
 
-		// Bank overlay
 		if (!g_bankPhrases.empty())
 		{
 			if (g_bankState == GB_PROMPT)
@@ -2892,7 +2836,6 @@ void main()
 			}
 		}
 
-		// Outfit unlock overlay
 		if (!g_outfitPhrases.empty())
 		{
 			if (g_outfitState == OUTFITS_PROMPT)
@@ -2959,14 +2902,14 @@ struct scrVec3N {
 
 class scrNativeCallContext {
 public:
-	void* m_ReturnValue;       // 0x0000
-	uint32_t m_ArgCount;       // 0x0008
-	uint64_t* m_Args;          // 0x0010
-	uint32_t m_DataCount;      // 0x0018
-	uint32_t pad2;             // 0x001C
-	scrVector* m_OutVectors[4];// 0x0020
-	scrVec3N m_InVectors[4];   // 0x0040
-	uint8_t _pad[96];          // 0x0070
+	void* m_ReturnValue;
+	uint32_t m_ArgCount;
+	uint64_t* m_Args;
+	uint32_t m_DataCount;
+	uint32_t pad2;
+	scrVector* m_OutVectors[4];
+	scrVec3N m_InVectors[4];
+	uint8_t _pad[96];
 
 	template <typename T>
 	T GetArg(int Index) const
@@ -3221,13 +3164,6 @@ void SniperHook_Shutdown()
 
 using namespace std;
 
-// ---------------------------------------------------------------------------
-// Layout (RDR2 1.0.1491.50, decompiled shop_horse_shop_sp):
-//   Global_40.f_1095.f_1[slot /*436*/]; array header (count) at global 1136,
-//   element i starts at 1137 + i*436. Cells are 8 bytes, ints in the low dword.
-//   f_8 = breed hash, f_9 = model hash, f_14 = state (0 empty, 1, 2).
-// Validated at startup; on mismatch the module disables itself.
-// ---------------------------------------------------------------------------
 static const int kArrayHeader = 40 + 1095 + 1;
 static const int kStride      = 436;
 static const int kSlots       = 7;
@@ -3237,11 +3173,10 @@ static const int kFState      = 14;
 static inline int GIdx(int slot, int field) { return kArrayHeader + 1 + slot * kStride + field; }
 
 static bool   g_enabled = false;
-static bool   g_dryRun  = false;    // fixed: the module always writes (no ini switch)
-static bool   g_materialize = false;   // disabled: never create/delete replacement horse entities
+static bool   g_dryRun  = false;
+static bool   g_materialize = false;
 static string g_dbPath;
 
-// ---- safe global access ---------------------------------------------------
 static bool RdG64(int idx, uint64_t &out)
 {
 	UINT64 *p = getGlobalPtr(idx);
@@ -3260,7 +3195,7 @@ static bool RdG(int idx, uint32_t &out)
 	out = (uint32_t)(v & 0xFFFFFFFFull);
 	return true;
 }
-static bool WrG(int idx, uint32_t v)   // low dword only
+static bool WrG(int idx, uint32_t v)
 {
 	UINT64 *p = getGlobalPtr(idx);
 	if (!p) return false;
@@ -3290,7 +3225,6 @@ static bool WritePair(int slot, uint32_t breed, uint32_t model)
 	return r.ok && r.breed == breed && r.model == model;
 }
 
-// ---- hashing / tables -----------------------------------------------------
 static uint32_t Joaat(const char *s)
 {
 	uint32_t h = 0;
@@ -3356,12 +3290,9 @@ static const char *kOnlineModels[] = {
 	"A_C_HORSE_TURKOMAN_PERLINO",
 };
 
-// Donor families (SP horses; hashes from the reference log).
 enum Family { DONOR_1 = 0, DONOR_2, DONOR_3, DONOR_4, F_COUNT };
 struct Donor { const char *name; uint32_t breed, model; };
 static const Donor kDonors[F_COUNT] = {
-	// Murfreebrood "mange" horses: known to the stable tables (breed/class/coat) and never legit stable horses
-	// Only these three donors are used for Online horse conversion.
 	{ "MURFREE_MANGE_01",   0xF1F348C6, 0x36AE742C },
 	{ "MURFREE_MANGE_02",   0xFFE664AC, 0xC97A99C6 },
 	{ "MURFREE_MANGE_03",   0xC5B77047, 0xDC4D3F6B },
@@ -3370,10 +3301,8 @@ static const Donor kDonors[F_COUNT] = {
 
 static int FamilyOf(const char *name)
 {
-	// Only the three Murfree mange donors are used now.
 	return DONOR_1;
 }
-// Breed hash = joaat("BREED_" + model name without "A_C_HORSE_") (verified on the reference log).
 static uint32_t BreedOf(const char *model)
 {
 	string n(model);
@@ -3383,7 +3312,7 @@ static uint32_t BreedOf(const char *model)
 }
 
 struct OnlineModel { uint32_t hash; int family; uint32_t breed; string name; };
-static string BreedKey(const string &modelName)   // "BREED_<suffix>_BREED"
+static string BreedKey(const string &modelName)
 {
 	string n = modelName;
 	if (n.size() > 10 && n.compare(0, 10, "A_C_HORSE_") == 0) n = n.substr(10);
@@ -3396,9 +3325,22 @@ static const OnlineModel *FindOnline(uint32_t model)
 	return nullptr;
 }
 
-// ---- sidecar: donor index -> real identity --------------------------------
 struct MapEntry { bool valid; uint32_t realBreed, realModel; int ownerSlot; };
 static MapEntry g_map[F_COUNT];
+
+static DWORD ResolveApocalypseHorseModel(Ped horse, DWORD visibleModel)
+{
+	(void)horse;
+	if (FindOnline(visibleModel)) return visibleModel;
+	for (int d = 0; d < 3; d++)
+	{
+		if (kDonors[d].model != visibleModel) continue;
+		if (g_map[d].valid && FindOnline(g_map[d].realModel))
+			return g_map[d].realModel;
+	}
+	return visibleModel;
+}
+
 
 static string MapLine(int d)
 {
@@ -3410,7 +3352,7 @@ static string MapLine(int d)
 	return t;
 }
 
-static bool SaveMapToFile()   // fallback only (ini not writable)
+static bool SaveMapToFile()
 {
 	string tmp = g_dbPath + ".tmp";
 	HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -3425,13 +3367,7 @@ static bool SaveMapToFile()   // fallback only (ini not writable)
 	return MoveFileExA(tmp.c_str(), g_dbPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
-// ---- the database lives in the [Stall] section of Dreamaker-Mod.ini ------------------------------------
-// Only that section is rewritten: every other byte of the ini (comments, order, encoding, BOM, line endings) is
-// kept as it is. The section holds one line per donor that currently stands for an Online horse (same line format
-// the old Dreamaker-Mod.db used):
-//   [Stall]
-//   0 <real breed> <real model> <donor breed> <donor model> <owner slot>  ; readable comment
-static string g_iniPath;   // Dreamaker-Mod.ini
+static string g_iniPath;
 
 static bool ReadWholeFile(const string &path, string &out)
 {
@@ -3467,12 +3403,12 @@ static bool SaveMapToIni()
 {
 	if (g_iniPath.empty()) return false;
 	string src;
-	if (!ReadWholeFile(g_iniPath, src)) return false;   // no ini yet: nothing to attach the database to
+	if (!ReadWholeFile(g_iniPath, src)) return false;
 	const string nl = (src.find("\r\n") != string::npos || src.find('\n') == string::npos) ? "\r\n" : "\n";
 	vector<string> lines, out;
 	SplitLines(src, lines);
 	bool skipping = false;
-	for (size_t i = 0; i < lines.size(); i++)   // everything except the old [Stall] section
+	for (size_t i = 0; i < lines.size(); i++)
 	{
 		string t = Trim(lines[i]);
 		if (!skipping)
@@ -3480,7 +3416,7 @@ static bool SaveMapToIni()
 			if (IsDbHeader(lines[i])) { skipping = true; continue; }
 			out.push_back(lines[i]);
 		}
-		else if (!t.empty() && t[0] == '[') { skipping = false; out.push_back(lines[i]); }   // next section: keep it
+		else if (!t.empty() && t[0] == '[') { skipping = false; out.push_back(lines[i]); }
 	}
 	while (!out.empty() && Trim(out.back()).empty()) out.pop_back();
 	bool any = false;
@@ -3490,11 +3426,11 @@ static bool SaveMapToIni()
 		out.push_back("");
 		out.push_back("[Stall]");
 		for (int d = 0; d < F_COUNT; d++)
-			if (g_map[d].valid) out.push_back(MapLine(d));   // "d rb rm db dm owner  ; comment"
+			if (g_map[d].valid) out.push_back(MapLine(d));
 	}
 	string txt;
 	for (size_t i = 0; i < out.size(); i++) { txt += out[i]; txt += nl; }
-	if (txt == src) return true;                    // nothing changed
+	if (txt == src) return true;
 	string tmp = g_iniPath + ".tmp";
 	HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (h == INVALID_HANDLE_VALUE) return false;
@@ -3511,7 +3447,7 @@ static bool SaveMap()
 {
 	if (SaveMapToIni())
 	{
-		DeleteFileA(g_dbPath.c_str());   // the legacy file must never come back to life with stale horses
+		DeleteFileA(g_dbPath.c_str());
 		return true;
 	}
 	return SaveMapToFile();
@@ -3534,7 +3470,6 @@ static int CountMapEntries()
 	return n;
 }
 
-// reads the [Stall] section of the ini; returns the number of entries found
 static int LoadMapFromIni()
 {
 	string src;
@@ -3548,7 +3483,7 @@ static int LoadMapFromIni()
 		if (t.empty() || t[0] == ';') continue;
 		if (t[0] == '[') { inDb = IsDbHeader(t); continue; }
 		if (!inDb) continue;
-		ParseMapLine(t.c_str());   // "d rb rm db dm owner  ; comment": the trailing comment is ignored by sscanf
+		ParseMapLine(t.c_str());
 	}
 	return CountMapEntries();
 }
@@ -3565,7 +3500,6 @@ static void LoadMap()
 		return;
 	}
 	if (!legacyExists) return;
-	// one-time migration of the legacy Dreamaker-Mod.db into the ini
 	FILE *f = nullptr;
 	if (fopen_s(&f, g_dbPath.c_str(), "rb") == 0 && f)
 	{
@@ -3581,14 +3515,7 @@ static void LoadMap()
 	else if (n == 0) { DeleteFileA(g_dbPath.c_str()); }
 }
 
-// ---- one-shot name at acquisition -------------------------------------------
-// An Online horse slot going from empty to occupied by a known Online horse is a purchase.
-// Renamed ONCE, right then, to its breed's localized label (the "BREED_<suffix>" game text, whatever
-// language the player selected - e.g. "Puro-Sangue Inglês" for a Thoroughbred).
-// NEVER renames an existing name: the game's default PLAYER_HORSE_NAME_DEFAULT ("Meu Cavalo"/"My Horse")
-// counts as a name - if the horse is called exactly that, the stable and the player own it for good.
-// A rename done through the vanilla stable menu is of course equally respected (it is never overwritten).
-static int DonorOfPair(uint32_t breed, uint32_t model);   // defined below
+static int DonorOfPair(uint32_t breed, uint32_t model);
 
 static string BreedSuffix(const string &modelName)
 {
@@ -3614,19 +3541,18 @@ static string TrimText(const char *text)
 static string LocalizedBreedName(const string &suffix)
 {
 	const string label = "BREED_" + suffix;
-	if (invoke<BOOL>(0x73C258C68D6F55B6ull, label.c_str()) == FALSE)   // DOES_TEXT_LABEL_EXIST
+	if (invoke<BOOL>(0x73C258C68D6F55B6ull, label.c_str()) == FALSE)
 		return string();
-	const char *text = invoke<const char *>(0xCFEDCCAD3C5BA90Dull, label.c_str());   // _GET_LABEL_TEXT
+	const char *text = invoke<const char *>(0xCFEDCCAD3C5BA90Dull, label.c_str());
 	return TrimText(text);
 }
 static string DefaultHorseName()
 {
-	// the game's default horse name label; what the stable shows/proposes for a never-named horse
 	static string cached;
 	static bool done = false;
 	if (done) return cached;
 	done = true;
-	cached = TrimText(invoke<const char *>(0xCFEDCCAD3C5BA90Dull, "PLAYER_HORSE_NAME_DEFAULT"));   // _GET_LABEL_TEXT
+	cached = TrimText(invoke<const char *>(0xCFEDCCAD3C5BA90Dull, "PLAYER_HORSE_NAME_DEFAULT"));
 	return cached;
 }
 static string ReadName(int slot)
@@ -3663,7 +3589,6 @@ static bool WrG64(int idx, uint64_t v)
 }
 static void WriteNameForce(int slot, const string &name)
 {
-	// wipe the name cells, then write the new name (NUL-padded, up to 31 bytes)
 	for (int c = 0; c < 8; c++) if (!WrG64(GIdx(slot, c), 0)) return;
 	unsigned char buf[64] = {};
 	size_t n = name.size() > 31 ? 31 : name.size();
@@ -3677,14 +3602,14 @@ static void WriteNameForce(int slot, const string &name)
 }
 static void RenameNewlyAcquired()
 {
-	if (g_autoRename <= 0) return;   // 0: never rename automatically (the stable flow rules)
+	if (g_autoRename <= 0) return;
 	static SlotInfo prev[kSlots];
 	static bool primed = false;
 	if (!primed)
 	{
 		for (int i = 0; i < kSlots; i++) prev[i] = ReadSlot(i);
 		primed = true;
-		return;   // horses already owned at load keep their current names
+		return;
 	}
 	for (int i = 0; i < kSlots; i++)
 	{
@@ -3693,15 +3618,12 @@ static void RenameNewlyAcquired()
 		bool isOcc  = cur.ok && cur.state != 0;
 		if (isOcc && !wasOcc)
 		{
-			// Never overwrite an existing name: neither a custom one nor the game's default
-			// "Meu Cavalo"/"My Horse" (PLAYER_HORSE_NAME_DEFAULT). Only a nameless horse is ours.
 			string curName = ReadName(i);
 			string defName = DefaultHorseName();
 			bool named = !curName.empty() || (!defName.empty() && SameName(curName, defName));
 			if (named) { prev[i] = cur; continue; }
 
 			const OnlineModel *om = FindOnline(cur.model);
-			// The donor conversion may have happened before this poll saw the slot: map back to the real horse.
 			if (!om) { int d = DonorOfPair(cur.breed, cur.model); if (d >= 0 && g_map[d].valid) om = FindOnline(g_map[d].realModel); }
 			if (om)
 			{
@@ -3712,10 +3634,7 @@ static void RenameNewlyAcquired()
 		prev[i] = cur;
 	}
 }
-// ---- conversion: Online horse record -> SP donor --------------------------
-// A donor whose model is also a normal story horse that the player owns as a REAL horse (e.g. the Tennessee Walker
-// Chestnut bought at a stable) is ambiguous: a ped with that model can be the donor stand-in or the real horse,
-// and the stable HUD would label one with the other's identity. Such a donor is never handed out.
+
 static bool DonorModelOwnedByRealHorse(int d)
 {
 	for (int i = 0; i < kSlots; i++)
@@ -3737,6 +3656,19 @@ static bool DonorInUse(int d, int exceptSlot)
 	return false;
 }
 
+static string BreedSuffix(const string &modelName);
+static string LocalizedBreedName(const string &suffix);
+static string ReadName(int slot);
+static void WriteNameForce(int slot, const string &name);
+
+static void PreserveOnlineHorseNickname(int slot, const OnlineModel &om)
+{
+	string current = ReadName(slot);
+	if (!current.empty()) return;
+	string correctName = LocalizedBreedName(BreedSuffix(om.name));
+	if (!correctName.empty()) WriteNameForce(slot, correctName);
+}
+
 static void ConvertOnlineSlots()
 {
 	for (int i = 0; i < kSlots; i++)
@@ -3748,18 +3680,17 @@ static void ConvertOnlineSlots()
 
 		uint32_t realBreed = s.breed ? s.breed : om->breed;
 
-		// pick donor: (1) donor already mapped to this real model and free,
-		// (2) family donor if free, (3) any free donor.
+		PreserveOnlineHorseNickname(i, *om);
+
 		int pick = -1;
 		for (int d = 0; d < F_COUNT && pick < 0; d++)
 			if (g_map[d].valid && g_map[d].realModel == s.model && !DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;
-		for (int d = DONOR_1; d <= DONOR_3 && pick < 0; d++) if (!DonorInUse(d, i)) pick = d;   // preferred donors: the three Murfreebrood models
-		for (int d = 0; d < F_COUNT && pick < 0; d++) if (!DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;   // last resort: the Tennessee Walker Chestnut
+		for (int d = DONOR_1; d <= DONOR_3 && pick < 0; d++) if (!DonorInUse(d, i)) pick = d;
+		for (int d = 0; d < F_COUNT && pick < 0; d++) if (!DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;
 		if (pick < 0) { continue; }
 
 		if (g_dryRun) continue;
 
-		// sidecar first (durable), then the single memory write
 		MapEntry old = g_map[pick];
 		g_map[pick].valid = true; g_map[pick].realBreed = realBreed; g_map[pick].realModel = s.model; g_map[pick].ownerSlot = i;
 		if (!SaveMap())
@@ -3775,11 +3706,6 @@ static void ConvertOnlineSlots()
 	}
 }
 
-// ---- real-at-rest / donors-near-stable ---------------------------------------
-// Stable-compatible policy: all occupied slots, including the active saddle horse,
-// may use donor pairs while the player is physically approaching/interacting with
-// a configured stable. Scripted cameras alone are not a trigger; pause/save restores
-// real pairs immediately.
 static bool g_donorMode = false;
 static int DonorOfPair(uint32_t breed, uint32_t model);
 
@@ -3803,13 +3729,6 @@ static void EnterDonorMode()
 {
 	g_donorMode = true;
 	if (g_dryRun) return;
-
-	// IMPORTANT: g_map is persistent identity metadata, not a snapshot of the
-	// currently materialized donor peds. At rest every Online horse is REAL, so
-	// no donor pair is expected to be present. Clearing the map here destroys the
-	// only information that tells us which real horse each donor belongs to after
-	// a reload.
-	// ConvertOnlineSlots() (run right after, every poll) assigns donors to real Online slots.
 }
 
 static void ExitDonorMode()
@@ -3818,36 +3737,28 @@ static void ExitDonorMode()
 	g_donorMode = false;
 }
 
-// ---- donor pair lookup -----------------------------------------------------
 static int DonorOfPair(uint32_t breed, uint32_t model)
 {
 	for (int d = 0; d < F_COUNT; d++) if (kDonors[d].breed == breed && kDonors[d].model == model) return d;
 	return -1;
 }
-// ---- automatic clean-up of the [Stall] database --------------------------------------------------------
-// An entry (donor -> real horse) only means something while that horse exists. Every entry has to be claimed by
-// exactly one occupied slot: either the slot holds the entry's donor pair (strong claim) or it holds the entry's
-// real Online pair at rest (weak claim, keeps the donor assignment of a horse stable between visits). An entry that
-// nobody claims for 4 s of normal play belongs to a horse that was sold / removed / lost (or to another save): its
-// line is deleted from the ini, so it can never be mistaken for a horse bought later. The owner slot written in the
-// line follows the horse when it is moved between stalls. The timers only run during normal play (control on, no
-// pause menu), so loading screens and half-finished stable transactions never delete anything.
+
 static void MapPrune(bool allow)
 {
 	static DWORD unclaimedSince[F_COUNT] = {};
 	if (g_dryRun) return;
 	if (!allow) { for (int d = 0; d < F_COUNT; d++) unclaimedSince[d] = 0; return; }
 	SlotInfo sl[kSlots];
-	for (int i = 0; i < kSlots; i++) { sl[i] = ReadSlot(i); if (!sl[i].ok) return; }   // never prune on an unreadable roster
+	for (int i = 0; i < kSlots; i++) { sl[i] = ReadSlot(i); if (!sl[i].ok) return; }
 	int claim[F_COUNT];
 	for (int d = 0; d < F_COUNT; d++) claim[d] = -1;
-	for (int i = 0; i < kSlots; i++)   // strong: the slot holds the donor pair of the entry
+	for (int i = 0; i < kSlots; i++)
 	{
 		if (sl[i].state == 0) continue;
 		int d = DonorOfPair(sl[i].breed, sl[i].model);
 		if (d >= 0 && g_map[d].valid && claim[d] < 0) claim[d] = i;
 	}
-	for (int i = 0; i < kSlots; i++)   // weak: the slot holds the real Online pair of the entry
+	for (int i = 0; i < kSlots; i++)
 	{
 		if (sl[i].state == 0 || DonorOfPair(sl[i].breed, sl[i].model) >= 0 || !FindOnline(sl[i].model)) continue;
 		int best = -1;
@@ -3880,9 +3791,6 @@ static void MapPrune(bool allow)
 	if (changed) SaveMap();
 }
 
-// ---- materialize: replace the donor ped of the ACTIVE horse by the real model -
-// Natives (public RDR3 native DB): _GET_SADDLE_HORSE_FOR_PLAYER 0xB48050D326E9A2F3,
-// _SET_PED_AS_SADDLE_HORSE_FOR_PLAYER 0xD2CB0FB0FDCB473D.
 static void MaterializeActiveHorse()
 {
 	static DWORD cooldownUntil = 0;
@@ -3902,7 +3810,7 @@ static void MaterializeActiveHorse()
 	Ped me = PLAYER::PLAYER_PED_ID();
 	Ped horse = invoke<Ped>(0xB48050D326E9A2F3ull, pl);
 	if (!horse || !ENTITY::DOES_ENTITY_EXIST(horse) || ENTITY::IS_ENTITY_DEAD(horse)) return;
-	if ((uint32_t)ENTITY::GET_ENTITY_MODEL(horse) != kDonors[d].model) return;   // already real
+	if ((uint32_t)ENTITY::GET_ENTITY_MODEL(horse) != kDonors[d].model) return;
 
 	if (PED::IS_PED_ON_MOUNT(me) && PED::GET_MOUNT(me) == horse)
 	{
@@ -3928,12 +3836,6 @@ static void MaterializeActiveHorse()
 	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(om->hash);
 }
 
-// ---- donor ped left over from a save made in donor mode -----------------------------------------------------
-// A save is written while the donor pair is in the record (so it stays loadable without the Online assets). On
-// load the game spawns the active horse from that record, i.e. as a Murfreebrood donor, and the ped keeps that
-// model after the record has been restored to the real Online pair. The record is right again by then, so the
-// leftover donor ped is retired (never while the player is riding it) and the game spawns the horse from the
-// real record the next time it is called - as the real Online horse.
 static void RetireDonorActiveHorseImpl()
 {
 	static DWORD nextCheck = 0;
@@ -3941,28 +3843,28 @@ static void RetireDonorActiveHorseImpl()
 	DWORD now = GetTickCount();
 	if (now < nextCheck) return;
 	nextCheck = now + 500;
-	if (g_donorMode) return;   // the record holds the donor pair right now: a respawn would be a donor again
+	if (g_donorMode) return;
 
 	SlotInfo s0 = ReadSlot(0);
 	if (!s0.ok || s0.state == 0) return;
-	const OnlineModel *om = FindOnline(s0.model);   // real at rest
+	const OnlineModel *om = FindOnline(s0.model);
 	if (!om) return;
 
 	Player pl = PLAYER::PLAYER_ID();
 	Ped me = PLAYER::PLAYER_PED_ID();
-	Ped horse = invoke<Ped>(0xB48050D326E9A2F3ull, pl);   // _GET_SADDLE_HORSE_FOR_PLAYER
+	Ped horse = invoke<Ped>(0xB48050D326E9A2F3ull, pl);
 	if (!horse || !ENTITY::DOES_ENTITY_EXIST(horse) || ENTITY::IS_ENTITY_DEAD(horse)) { attempts = 0; return; }
 
 	uint32_t hm = (uint32_t)ENTITY::GET_ENTITY_MODEL(horse);
 	int d = -1;
 	for (int dd = 0; dd < F_COUNT; dd++) if (kDonors[dd].model == hm) { d = dd; break; }
-	if (d < 0 || !g_map[d].valid || g_map[d].realModel != s0.model) { attempts = 0; return; }   // not a donor ped of THIS horse
+	if (d < 0 || !g_map[d].valid || g_map[d].realModel != s0.model) { attempts = 0; return; }
 
 	if (PED::IS_PED_ON_MOUNT(me) && PED::GET_MOUNT(me) == horse)
 	{
 		return;
 	}
-	if (attempts >= 6) return;   // safety valve
+	if (attempts >= 6) return;
 	attempts++;
 	ENTITY::SET_ENTITY_AS_MISSION_ENTITY(horse, TRUE, TRUE);
 	PED::DELETE_PED(&horse);
@@ -3975,15 +3877,9 @@ static void RetireDonorActiveHorse()
 	}
 }
 
-// Forward declarations: these implementations are defined later in this file.
 static Ped SlotPed(int slot);
 static void DiscoverEntField(const int *validPeds, int nValid);
 
-// Recover stale donor peds for stored horses as well as the active saddle horse.
-// This is deliberately handle-authoritative: a nearby Murfree horse is never
-// deleted just because its model happens to match a donor. The persistent slot
-// must point to that exact ped, the slot must already contain its REAL Online
-// pair, and the donor pair must no longer exist in any persistent slot.
 static void RetireMappedDonorPedsImpl()
 {
 	static DWORD nextCheck = 0;
@@ -4014,7 +3910,7 @@ static void RetireMappedDonorPedsImpl()
 		SlotInfo si = ReadSlot(slot);
 		if (!si.ok || si.state == 0) continue;
 		const OnlineModel *om = FindOnline(si.model);
-		if (!om) continue; // slot must already be restored to its real Online identity
+		if (!om) continue;
 		Ped ped = SlotPed(slot);
 		if (!ped || !ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped)) continue;
 		uint32_t pedModel = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
@@ -4033,7 +3929,7 @@ static void RetireMappedDonorPedsImpl()
 			SlotInfo os = ReadSlot(other);
 			if (os.ok && os.state != 0 && os.breed == kDonors[donor].breed && os.model == kDonors[donor].model) donorRecords++;
 		}
-		if (donorRecords != 0) continue; // still assigned in persistent data; do not touch it
+		if (donorRecords != 0) continue;
 		if (PED::IS_PED_ON_MOUNT(player) && PED::GET_MOUNT(player) == ped) continue;
 
 		Vector3 pos = ENTITY::GET_ENTITY_COORDS(ped, TRUE, TRUE);
@@ -4050,15 +3946,7 @@ static void RetireMappedDonorPeds()
 	}
 }
 
-// ---- Stable HUD: Type / Breed / Coat for Online horses ----------------------------
-// The SP stable builds these three labels from the model of the displayed ped through a fixed
-// SP-only table, so Online models come out blank. Like the reference mod, the three hashes are
-// rewritten in the "GenericShop/Scene" data container while the stable menu is open (UI only).
-// Natives (public RDR3 native DB): _DATABINDING_GET_DATA_CONTAINER_FROM_PATH 0x0C827D175F1292F2,
-// DATABINDING_IS_ENTRY_VALID 0x1E7130793AAAAB8D, _DATABINDING_READ_DATA_HASH_STRING_FROM_PARENT
-// 0x9B535990B01B62DE, _DATABINDING_WRITE_DATA_HASH_STRING_FROM_PARENT 0x0971F04E1EAA7AE8,
-// _IS_THIS_MODEL_A_HORSE 0x772A1969F649E902.
-static bool g_hud = true;    // Type/Breed/Coat in the stable menu (diagnostic build: logs every early exit)
+static bool g_hud = true;
 struct HudCoat { const char *model; const char *coat; };
 static const HudCoat kCoats[] = {
 	{ "A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE", "COAT_BLACKSNO" },
@@ -4115,28 +4003,26 @@ static const HudCoat kCoats[] = {
 static const char *CoatLabelFor(const string &modelName)
 {
 	for (size_t i = 0; i < sizeof(kCoats) / sizeof(kCoats[0]); i++) if (modelName == kCoats[i].model) return kCoats[i].coat;
-	return nullptr;   // unknown label: leave the coat untouched
+	return nullptr;
 }
-// Stats (Health, Stamina, Speed, Acceleration) and class per Online horse, as supplied by the user.
-// Attribute ids: 0 health, 1 stamina, 5 speed, 6 acceleration (5/6 confirmed in the SP stable script;
-// the UI shows GET_ATTRIBUTE_BASE_RANK + 1, so the table values are applied as rank = value - 1).
+
 struct HorseStat { const char *model; int health, stamina, speed, acc; const char *type; };
 static const HorseStat kStats[] = {
 	{ "A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE", 4, 5, 4, 4, "HORSE_CLASS_WORK" },
 	{ "A_C_HORSE_ARABIAN_GREY", 5, 5, 6, 6, "HORSE_CLASS_SUPERIOR" },
 	{ "A_C_HORSE_ARDENNES_IRONGREYROAN", 7, 5, 3, 3, "HORSE_CLASS_WAR" },
-	{ "A_C_HORSE_BRETON_GRULLODUN", 5, 6, 5, 3, "HORSE_CLASS_RACEWAR" },
-	{ "A_C_HORSE_BRETON_MEALYDAPPLEBAY", 6, 7, 6, 4, "HORSE_CLASS_RACEWAR" },
-	{ "A_C_HORSE_BRETON_REDROAN", 4, 5, 4, 2, "HORSE_CLASS_RACEWAR" },
-	{ "A_C_HORSE_BRETON_SEALBROWN", 5, 6, 5, 3, "HORSE_CLASS_RACEWAR" },
-	{ "A_C_HORSE_BRETON_SORREL", 4, 5, 4, 2, "HORSE_CLASS_RACEWAR" },
-	{ "A_C_HORSE_BRETON_STEELGREY", 6, 7, 6, 4, "HORSE_CLASS_RACEWAR" },
-	{ "A_C_HORSE_CRIOLLO_BAYBRINDLE", 4, 5, 6, 4, "HORSE_CLASS_RACEWORK" },
-	{ "A_C_HORSE_CRIOLLO_BAYFRAMEOVERO", 5, 6, 7, 5, "HORSE_CLASS_RACEWORK" },
-	{ "A_C_HORSE_CRIOLLO_BLUEROANOVERO", 3, 4, 5, 3, "HORSE_CLASS_RACEWORK" },
-	{ "A_C_HORSE_CRIOLLO_DUN", 3, 4, 5, 3, "HORSE_CLASS_RACEWORK" },
-	{ "A_C_HORSE_CRIOLLO_MARBLESABINO", 5, 6, 7, 5, "HORSE_CLASS_RACEWORK" },
-	{ "A_C_HORSE_CRIOLLO_SORRELOVERO", 4, 5, 6, 4, "HORSE_CLASS_RACEWORK" },
+	{ "A_C_HORSE_BRETON_GRULLODUN", 5, 6, 5, 3, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_BRETON_MEALYDAPPLEBAY", 6, 7, 6, 4, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_BRETON_REDROAN", 4, 5, 4, 2, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_BRETON_SEALBROWN", 5, 6, 5, 3, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_BRETON_SORREL", 4, 5, 4, 2, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_BRETON_STEELGREY", 6, 7, 6, 4, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_CRIOLLO_BAYBRINDLE", 4, 5, 6, 4, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_CRIOLLO_BAYFRAMEOVERO", 5, 6, 7, 5, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_CRIOLLO_BLUEROANOVERO", 3, 4, 5, 3, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_CRIOLLO_DUN", 3, 4, 5, 3, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_CRIOLLO_MARBLESABINO", 5, 6, 7, 5, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_CRIOLLO_SORRELOVERO", 4, 5, 6, 4, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_GYPSYCOB_PALOMINOBLAGDON", 7, 6, 3, 3, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_GYPSYCOB_PIEBALD", 6, 5, 2, 2, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_GYPSYCOB_SKEWBALD", 7, 6, 3, 3, "HORSE_CLASS_MULTI" },
@@ -4144,12 +4030,12 @@ static const HorseStat kStats[] = {
 	{ "A_C_HORSE_GYPSYCOB_SPLASHEDPIEBALD", 7, 7, 5, 4, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_GYPSYCOB_WHITEBLAGDON", 6, 5, 2, 2, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_HUNGARIANHALFBRED_LIVERCHESTNUT", 7, 6, 4, 4, "HORSE_CLASS_WAR" },
-	{ "A_C_HORSE_KLADRUBER_BLACK", 5, 5, 2, 3, "HORSE_CLASS_WARWORK" },
-	{ "A_C_HORSE_KLADRUBER_CREMELLO", 6, 6, 3, 4, "HORSE_CLASS_WARWORK" },
-	{ "A_C_HORSE_KLADRUBER_DAPPLEROSEGREY", 7, 7, 4, 5, "HORSE_CLASS_WARWORK" },
-	{ "A_C_HORSE_KLADRUBER_GREY", 6, 6, 3, 4, "HORSE_CLASS_WARWORK" },
-	{ "A_C_HORSE_KLADRUBER_SILVER", 7, 7, 4, 5, "HORSE_CLASS_WARWORK" },
-	{ "A_C_HORSE_KLADRUBER_WHITE", 5, 5, 2, 3, "HORSE_CLASS_WARWORK" },
+	{ "A_C_HORSE_KLADRUBER_BLACK", 5, 5, 2, 3, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_KLADRUBER_CREMELLO", 6, 6, 3, 4, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_KLADRUBER_DAPPLEROSEGREY", 7, 7, 4, 5, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_KLADRUBER_GREY", 6, 6, 3, 4, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_KLADRUBER_SILVER", 7, 7, 4, 5, "HORSE_CLASS_MULTI" },
+	{ "A_C_HORSE_KLADRUBER_WHITE", 5, 5, 2, 3, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_MISSOURIFOXTROTTER_BLACKTOVERO", 5, 6, 7, 5, "HORSE_CLASS_RACEWORK" },
 	{ "A_C_HORSE_MISSOURIFOXTROTTER_BLUEROAN", 5, 6, 7, 5, "HORSE_CLASS_RACEWORK" },
 	{ "A_C_HORSE_MISSOURIFOXTROTTER_BUCKSKINBRINDLE", 5, 6, 7, 5, "HORSE_CLASS_RACEWORK" },
@@ -4187,8 +4073,6 @@ static const char *TypeLabelFor(const OnlineModel &om)
 static BOOL DbValid(Any e) { return e ? invoke<BOOL>(0x1E7130793AAAAB8Dull, e) : FALSE; }
 static uint32_t DbReadHash(Any c, const char *key) { return (uint32_t)invoke<Any>(0x9B535990B01B62DEull, c, key); }
 
-// The stable script creates "GenericShop" (top level) and, under it, "Prompts" and "Scene".
-// Plain path lookups only work for top-level names, so Scene is found through the children.
 static Any FindSceneContainer()
 {
 	static const char *paths[] = { "GenericShop.Scene", "GenericShop/Scene" };
@@ -4204,20 +4088,15 @@ static Any FindSceneContainer()
 	Any guess = 0;
 	for (int idx = 0; idx < 16; idx++)
 	{
-		Any c = invoke<Any>(0x0C827D175F1292F3ull, (Hash)parent, idx);   // _DATABINDING_GET_DATA_CONTAINER_FROM_CHILD_INDEX
+		Any c = invoke<Any>(0x0C827D175F1292F3ull, (Hash)parent, idx);
 		if (!DbValid(c)) continue;
 		uint32_t t = DbReadHash(c, "HorseType"), b = DbReadHash(c, "HorseBreed"), co = DbReadHash(c, "HorseCoat");
-		if (t || b || co) return c;   // the container where the script wrote the horse labels
-		if (idx == 2) guess = c;      // creation order: Title, Prompts, Scene
+		if (t || b || co) return c;
+		if (idx == 2) guess = c;
 	}
 	return guess;
 }
 
-// ---- slot <-> runtime ped (exact identity, no geometry) ------------------------------------------------
-// Every persistent horse record keeps the handle of its runtime ped in one of its cells. The cell is located
-// at run time (a cell that holds a valid horse ped whose model matches the slot's donor/real model for several
-// slots), so the stable HUD can resolve "which horse is this ped" through the slot itself instead of guessing
-// from the model alone.
 static int g_entField = -1;
 static Ped SlotPed(int slot)
 {
@@ -4226,10 +4105,7 @@ static Ped SlotPed(int slot)
 	if (!RdG(GIdx(slot, g_entField), v) || v == 0 || v > 0x7FFFFFFFu) return 0;
 	return (Ped)v;
 }
-// ---- apelido (nickname) verification ---------------------------------------------------------------
-// The four horsemen are the only Apocalypse-horse entries with a nickname requirement: the stable record
-// (cells f0..f7 in the persistent record) must carry one of the horse's accepted names, in ANY case,
-// for the horse to get the PerfectHorses boost. The nickname is the horse's own - not the donor's/stand-in's.
+
 static string TrimNickname(const string &s)
 {
 	size_t b = s.find_first_not_of(" \t\r\n");
@@ -4240,16 +4116,11 @@ static string TrimNickname(const string &s)
 static int FindSlotForPed(Ped horse)
 {
 	if (horse == 0) return -1;
-	// exact identity first: the record's ped cell (discovered at run time)
 	for (int i = 0; i < kSlots; i++)
 	{
 		SlotInfo s = ReadSlot(i);
 		if (s.ok && s.state != 0 && SlotPed(i) == horse) return i;
 	}
-	// fallback by model. An Online horse near a stable has the SP donor pair in its record (donor mode), so the
-	// record's model is the donor's, not the ped's real Online model: the donor map says which real horse each donor
-	// stands for. Without this the nickname of an Online horse could not be found while donors were on, and the
-	// Apocalypse boost was silently dropped (and came back later) - "sometimes no boost".
 	DWORD m = ENTITY::GET_ENTITY_MODEL(horse);
 	int matches[kSlots]; int nm = 0;
 	for (int i = 0; i < kSlots; i++)
@@ -4267,7 +4138,6 @@ static int FindSlotForPed(Ped horse)
 	if (nm == 0) return -1;
 	if (nm > 1)
 	{
-		// several horses of the same model: the one the player rides is the active horse (slot 0)
 		Ped player = PLAYER::PLAYER_PED_ID();
 		if (ENTITY::DOES_ENTITY_EXIST(player) && PED::GET_MOUNT(player) == horse)
 			for (int k = 0; k < nm; k++) if (matches[k] == 0) return 0;
@@ -4276,7 +4146,7 @@ static int FindSlotForPed(Ped horse)
 }
 static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse)
 {
-	if (!entry.HasRequiredNames()) return true;   // no nickname requirement for this entry
+	if (!entry.HasRequiredNames()) return true;
 	int slot = FindSlotForPed(horse);
 	if (slot < 0) return false;
 	string name = TrimNickname(ReadName(slot));
@@ -4301,7 +4171,7 @@ static void DiscoverEntField(const int *validPeds, int nValid)
 			if (!si.ok || si.state == 0) continue;
 			uint32_t v = 0;
 			if (!RdG(GIdx(sl, f), v) || v == 0) continue;
-			for (int k = 0; k < nValid; k++)   // the cell must hold the handle of a real, live horse ped
+			for (int k = 0; k < nValid; k++)
 			{
 				if ((uint32_t)validPeds[k] != v) continue;
 				uint32_t pm = (uint32_t)ENTITY::GET_ENTITY_MODEL((Ped)v);
@@ -4328,8 +4198,7 @@ static bool IsKnownHorseModel(uint32_t pm)
 	for (int d = 0; d < F_COUNT; d++) if (kDonors[d].model == pm) return true;
 	return false;
 }
-// Is the donor pair of donor d currently held by a persistent slot? (a ped with a donor's model is only a donor
-// stand-in while some slot really holds that donor pair - otherwise it is a normal horse, e.g. a bought Tennessee Walker Chestnut)
+
 static bool DonorHeld(int d)
 {
 	if (d < 0 || d >= F_COUNT) return false;
@@ -4341,7 +4210,6 @@ static bool DonorHeld(int d)
 	return false;
 }
 
-// Which Online horse is this ped? Slot first (exact), then by model (real Online model or mapped donor).
 static const OnlineModel *HudIdentity(Ped ped, uint32_t pedModel, int &slotOut, const char *&how)
 {
 	slotOut = -1; how = "none";
@@ -4364,9 +4232,6 @@ static const OnlineModel *HudIdentity(Ped ped, uint32_t pedModel, int &slotOut, 
 	return nullptr;
 }
 
-// Every ped in the world pool (the player-relative "nearby" list does not reach the far end of the stable: the
-// stall ped of the 4th position was never in it, so that horse could never be identified). Guarded: if the
-// call ever faults it is switched off for the session and the nearby list alone is used.
 static bool g_worldPedsBroken = false;
 static int SafeWorldGetAllPeds(int *arr, int n)
 {
@@ -4375,19 +4240,14 @@ static int SafeWorldGetAllPeds(int *arr, int n)
 	__except (EXCEPTION_EXECUTE_HANDLER) { g_worldPedsBroken = true; return 0; }
 }
 
-// Blank the three labels. Used when the labels on screen are ones WE wrote for another horse: the script does not
-// always rewrite them when the selection moves to a horse it cannot label (an Online horse), so the previous
-// horse's Type/Breed/Coat used to stay there - a blank label is better than another horse's information.
 static void HudClearOurs(Any cont, bool &haveOurs)
 {
 	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseType", (Hash)0);
-	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseBreed", (Hash)0xE86CEE40);   // joaat("_BREED"), what the script writes for an unknown model
+	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseBreed", (Hash)0xE86CEE40);
 	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseCoat", (Hash)0);
 	haveOurs = false;
 }
 
-// Elimination: the Online horses of the stable stalls (slots 1-5) that have NO ped among the horse peds around.
-// If exactly one is missing, that is the horse on display (its ped is not in the picture / not in the lists).
 static int HudMissingStableSlot(const uint32_t *pedModels, int np, const OnlineModel **omOut)
 {
 	bool used[96] = {};
@@ -4401,7 +4261,7 @@ static int HudMissingStableSlot(const uint32_t *pedModels, int np, const OnlineM
 		int d = DonorOfPair(s.breed, s.model);
 		if (d >= 0 && g_map[d].valid && DonorHeld(d)) { real = g_map[d].realModel; donor = kDonors[d].model; m = FindOnline(real); }
 		else if ((m = FindOnline(s.model)) != nullptr) { real = s.model; }
-		if (!m) continue;   // a normal story horse: not our business
+		if (!m) continue;
 		bool matched = false;
 		for (int k = 0; k < np && k < 96; k++)
 			if (!used[k] && (pedModels[k] == real || (donor && pedModels[k] == donor))) { used[k] = true; matched = true; break; }
@@ -4410,11 +4270,6 @@ static int HudMissingStableSlot(const uint32_t *pedModels, int np, const OnlineM
 	return nMissing == 1 ? missing : -1;
 }
 
-// Stable HUD labels. The horse on display is picked among ALL horse peds (never only among the known Online
-// ones - that is what made a neighbour Online horse lend its labels), it has to be the same ped for several
-// consecutive samples with the stable camera at rest (the script moves the camera to the new horse for about
-// a second after every selection change), and only then is it classified: Online -> the three labels are
-// written (always, whatever the script left there), anything else -> untouched.
 static void ApplyStableHud(bool inMenu)
 {
 	static Ped candPed = 0; static int candCount = 0; static Vector3 prevCam;
@@ -4432,15 +4287,13 @@ static void ApplyStableHud(bool inMenu)
 	uint32_t curBreed = DbReadHash(cont, "HorseBreed");
 	uint32_t curCoat  = DbReadHash(cont, "HorseCoat");
 
-	// camera
 	Vector3 ref = ENTITY::GET_ENTITY_COORDS(PLAYER::PLAYER_PED_ID(), TRUE, TRUE);
 	Cam cam = CAM::GET_RENDERING_CAM();
 	if (cam) { Vector3 cp = CAM::GET_CAM_COORD(cam); if (cp.x != 0.0f || cp.y != 0.0f || cp.z != 0.0f) ref = cp; }
 	const float camMoved = sqrtf((ref.x - prevCam.x) * (ref.x - prevCam.x) + (ref.y - prevCam.y) * (ref.y - prevCam.y) + (ref.z - prevCam.z) * (ref.z - prevCam.z));
 	prevCam = ref;
 
-	// all horse peds in front of the camera
-	static const float kFocusX = 0.62f, kFocusY = 0.55f;   // where the stable scene frames the selected horse
+	static const float kFocusX = 0.62f, kFocusY = 0.55f;
 	struct HudCand { Ped ped; uint32_t model; float sx, sy, dist, score; bool onScreen, visible; };
 	HudCand cands[64]; int nc = 0;
 	int peds[32 + 1]; peds[0] = 32;
@@ -4463,16 +4316,12 @@ static void ApplyStableHud(bool inMenu)
 		Ped ped = (Ped)pedList[i];
 		if (ped == player || !ENTITY::DOES_ENTITY_EXIST(ped)) continue;
 		uint32_t pm = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
-		// _IS_THIS_MODEL_A_HORSE, but our donors (MURFREE mange / Tennessee Walker Chestnut) and Online models are always accepted -
-		// the game may not class the donor stand-ins as horses, which left the 4th horse without Type/Breed/Coat.
 		if (!IsKnownHorseModel(pm) && !invoke<BOOL>(0x772A1969F649E902ull, (Hash)pm)) continue;
 		Vector3 p = ENTITY::GET_ENTITY_COORDS(ped, TRUE, TRUE);
 		float d2 = (p.x - ref.x) * (p.x - ref.x) + (p.y - ref.y) * (p.y - ref.y) + (p.z - ref.z) * (p.z - ref.z);
 		if (d2 > 30.0f * 30.0f) continue;
 		HudCand &c = cands[nc++];
 		c.ped = ped; c.model = pm; c.dist = sqrtf(d2); c.sx = 0.0f; c.sy = 0.0f;
-		// the ped origin can fall outside the picture when the camera is close to the horse (close-up of a stall):
-		// probe a few heights and take the first one that projects into the frame
 		c.onScreen = false;
 		{
 			static const float kProbe[3] = { 0.3f, 1.0f, -0.4f };
@@ -4491,13 +4340,13 @@ static void ApplyStableHud(bool inMenu)
 		for (int i = 0; i < nc; i++) vp[i] = (int)cands[i].ped;
 		DiscoverEntField(vp, nc);
 	}
-	static const uint32_t kBlankBreed = 0xE86CEE40;   // joaat("_BREED")
+	static const uint32_t kBlankBreed = 0xE86CEE40;
 	const bool holdsOurs = haveOurs && curType == oursType && curBreed == oursBreed && curCoat == oursCoat;
 
 	int best = -1;
 	for (int i = 0; i < nc; i++)
 		if (cands[i].onScreen && (best < 0 || cands[i].score < cands[best].score)) best = i;
-	// a horse far from the framing point is a neighbour at the edge of the picture, not the displayed horse
+
 	const bool focusOk = best >= 0 && cands[best].score < 0.12f;
 
 	Ped shown = 0; int slot = -1; const char *how = "none";
@@ -4509,9 +4358,6 @@ static void ApplyStableHud(bool inMenu)
 	}
 	else
 	{
-		// The horse on display has no ped in the picture (this is what happened with the Online horse of the 4th
-		// position: nothing was identified, so the labels of the previous horse stayed or the labels stayed blank).
-		// Identify it by elimination: the one Online horse of the stalls whose ped is nowhere around.
 		uint32_t models[96]; int nm = 0;
 		for (int i = 0; i < nc && nm < 96; i++) models[nm++] = cands[i].model;
 		const OnlineModel *mm = nullptr;
@@ -4525,7 +4371,6 @@ static void ApplyStableHud(bool inMenu)
 		}
 	}
 
-	// the displayed horse changed (or the camera is still moving): never leave the previous horse's labels up
 	if (shown != candPed || camMoved > 0.15f)
 	{
 		if (shown != candPed && holdsOurs) HudClearOurs(cont, haveOurs);
@@ -4541,9 +4386,6 @@ static void ApplyStableHud(bool inMenu)
 		return;
 	}
 
-	// A plain-model match (no slot / donor mapping) on a model that also exists in the story game (e.g. Mustang
-	// Buckskin) is a normal SP horse when the script wrote real labels for it: leave those alone. Labels that
-	// are blank, or that we wrote ourselves for the previous horse, are always replaced.
 	if (curBreed != 0 && curBreed != kBlankBreed && !holdsOurs && !strcmp(how, "pedModel")) return;
 
 	const char *type = TypeLabelFor(*om);
@@ -4551,7 +4393,7 @@ static void ApplyStableHud(bool inMenu)
 	string breedKey = BreedKey(om->name);
 	const uint32_t wantType = Joaat(type), wantBreed = Joaat(breedKey.c_str());
 	const uint32_t wantCoat = coat ? Joaat(coat) : 0;
-	if (curType == wantType && curBreed == wantBreed && curCoat == wantCoat) { haveOurs = true; oursType = curType; oursBreed = curBreed; oursCoat = curCoat; return; }   // already correct
+	if (curType == wantType && curBreed == wantBreed && curCoat == wantCoat) { haveOurs = true; oursType = curType; oursBreed = curBreed; oursCoat = curCoat; return; }
 	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseType", (Hash)wantType);
 	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseBreed", (Hash)wantBreed);
 	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseCoat", (Hash)wantCoat);
@@ -4568,9 +4410,6 @@ static void ApplyStableHudSafe(bool inMenu)
 	}
 }
 
-// Real stats: set the base ranks on every nearby horse ped (UI bars and gameplay read them).
-// Online horses get the table ranks; any horse that qualifies for the Apocalypse boost - Online OR vanilla SP
-// (e.g. the horse on display in the stable scene) - gets THAT boost instead.
 static bool g_stats = true;
 static void ApplyOnlineStats()
 {
@@ -4586,47 +4425,29 @@ static void ApplyOnlineStats()
 	{
 		Ped ped = (Ped)buf[i + 1];
 		if (!ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped)) continue;
-		// A horse that qualifies for the Apocalypse boost (PerfectHorses) gets THAT boost, never the table values:
-		// this loop used to reset the base ranks to the table every 500 ms while the main loop re-applied the boost
-		// every frame, so the two fought and the boost was there only part of the time.
-		// Online OR vanilla SP: vanilla horses used to be skipped entirely here, so the boost never showed in the
-		// stable for them (the stable scene ped is not the player's mount, so the main loop never reached it).
+		const OnlineModel *om = FindOnline((uint32_t)ENTITY::GET_ENTITY_MODEL(ped));
+		if (!om) continue;
 		if (g_perfectHorses != 0 && IsApocalypseHorse(ped))
 		{
 			ApplyPerfectHorseStats(ped);
 			continue;
 		}
-		// A vanilla SP horse we boosted earlier that no longer qualifies (renamed, or PerfectHorses turned off):
-		// restore its original ranks. Online horses are covered by the table-stats write below; vanilla ones are not.
-		if (IsPerfectHorseBoosted(ped))
-		{
-			ApplyPerfectHorseStats(ped);   // not qualifying anymore: restores the saved original ranks
-			continue;
-		}
-		const OnlineModel *om = FindOnline((uint32_t)ENTITY::GET_ENTITY_MODEL(ped));
-		if (!om) continue;
 		const HorseStat *st = StatsFor(om->name);
 		if (!st) continue;
 		static const int attr[4] = { 0, 1, 5, 6 };
-		// the stable UI shows base rank + 1 (hash = hash + 1 in the SP script), so rank = table value - 1
 		const int want[4] = { st->health - 1, st->stamina - 1, st->speed - 1, st->acc - 1 };
 		int cur[4]; bool diff = false;
 		for (int k = 0; k < 4; k++)
 		{
-			cur[k] = invoke<int>(0x147149F2E909323Cull, ped, attr[k]);   // GET_ATTRIBUTE_BASE_RANK
+			cur[k] = invoke<int>(0x147149F2E909323Cull, ped, attr[k]);
 			if (cur[k] != want[k]) diff = true;
 		}
 		if (!diff) continue;
 		for (int k = 0; k < 4; k++)
-			if (cur[k] != want[k]) invoke<Void>(0x5DA12E025D47D4E5ull, ped, attr[k], want[k]);   // SET_ATTRIBUTE_BASE_RANK
+			if (cur[k] != want[k]) invoke<Void>(0x5DA12E025D47D4E5ull, ped, attr[k], want[k]);
 	}
 }
 
-// ---- face coverage (bandana/mask) detection --------------------------------
-// Face-covering detection used by the "Clear All Bounties and Lockdown Areas" feature.
-// Two checks, OR'ed together: the game's mask/bandana component CATEGORIES, plus the
-// exact item-descriptor hashes pulled from the reference binary (so the full set of
-// mask outfit parts is recognized, not only the bandana).
 static const DWORD kMaskItemHashes[] = {
 	0x4a9da893u, 0xe563cbf2u, 0x656a8ed4u, 0x446654cbu, 0xdc928ffcu,
 	0xe33f3da1u, 0x29f2d782u, 0xf0ac3045u, 0xa9257e62u, 0x3ecf4b14u,
@@ -4661,7 +4482,7 @@ static bool IsFaceCovered(Ped ped)
 	}
 	return false;
 }
-// ---- public ---------------------------------------------------------------
+
 void OnlineHorses_Init(const char *iniPath)
 {
 	char dir[MAX_PATH];
@@ -4669,10 +4490,9 @@ void OnlineHorses_Init(const char *iniPath)
 	string base(dir);
 	size_t sl = base.find_last_of("\\/");
 	base = (sl == string::npos) ? string() : base.substr(0, sl + 1);
-	g_dbPath  = base + "Dreamaker-Mod.db";   // legacy location: only read once to migrate it into the ini's [Stall] section
+	g_dbPath  = base + "Dreamaker-Mod.db";   // legacy location
 	g_iniPath = (iniPath && *iniPath) ? string(iniPath) : base + "Dreamaker-Mod.ini";
 
-	// the Online horses are always part of the mod: no options are read from the ini
 	g_dryRun = false; g_materialize = false; g_hud = true; g_stats = true;
 
 	g_online.clear();
@@ -4689,18 +4509,13 @@ void OnlineHorses_Init(const char *iniPath)
 		SlotInfo s = ReadSlot(i);
 		if (!s.ok || s.state > 2) return;
 	}
-	// A save can legitimately contain donor passports if the game was saved
-	// during a stable transaction. Recover them immediately, before normal
-	// polling can expose those donor identities to gameplay or overwrite them.
-	if (!g_dryRun) ToReal();   // A save can legitimately contain donor passports if the game was saved during a stable transaction: recover them before normal polling can overwrite them.
-	RenameNewlyAcquired();   // prime the acquisition detector AFTER the donor recovery
+
+	if (!g_dryRun) ToReal();
+	RenameNewlyAcquired();
 
 	g_enabled = true;
 }
 
-// The vanilla stable shop UI is up (its data container exists). Used when the player is at a stable that is not in
-// the ini (no zone, so the position detectors say "no stable"): without donors the shop script receives real
-// Online models and cannot place new horses ("stable bugged").
 static bool StableShopUiActive()
 {
 	static const char *paths[] = { "GenericShop.Scene", "GenericShop/Scene" };
@@ -4731,11 +4546,6 @@ void OnlineHorses_Tick(bool nearStable)
 
 	RenameNewlyAcquired();
 
-	// ---- donors <-> real-at-rest --------------------------------------------
-	// Donor mode is tied to a physical stable approach, never to a scripted
-	// camera by itself. The wider 12m detector starts conversion before the
-	// stable camera/menu opens, while avoiding false activation during unrelated
-	// cutscenes. Pause is treated as a save-safety boundary: restore REAL pairs.
 	static bool first = true;
 	static DWORD calmSince = 0;
 	bool ctrlOn = PLAYER::IS_PLAYER_CONTROL_ON(PLAYER::PLAYER_ID()) != 0;
