@@ -159,7 +159,7 @@ public:
 };
 
 const int
-	MenuBase_linesPerScreen = 11;
+	MenuBase_linesPerScreen = 10;
 
 extern float MenuBase_menuTop;
 extern float MenuBase_menuLeft;
