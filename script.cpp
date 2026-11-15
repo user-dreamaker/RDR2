@@ -218,6 +218,10 @@ static void ClearSpawnedPeds()
 
 static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse);
 static DWORD ResolveApocalypseHorseModel(Ped horse, DWORD visibleModel);
+static string TrimText(const char *text);
+static string LocalizedBreedName(const string &suffix);
+static string LocalizedGenderName(const string &genderKey);
+static string LocalizedMenuTitle(const char *labelKey, const char *fallback);
 static bool IsApocalypseHorse(Ped horse)
 {
 	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
@@ -313,7 +317,7 @@ static void ApplyPerfectHorseStats(Ped horse)
 	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 6, (float)g_perfectHorsesAcceleration, FALSE);
 }
 
-static Ped SpawnOneHorse(const SpawnEntry &s)
+static Ped SpawnOneHorse(const SpawnEntry &s, int forceGender = -1)
 {
 	DWORD model = GAMEPLAY::GET_HASH_KEY(const_cast<char *>(s.model.c_str()));
 	if (!STREAMING::IS_MODEL_IN_CDIMAGE(model) || !STREAMING::IS_MODEL_VALID(model))
@@ -338,6 +342,18 @@ static Ped SpawnOneHorse(const SpawnEntry &s)
 		PED::SET_PED_FLEE_ATTRIBUTES(horse, 0, FALSE);
 		AUDIO::SET_ANIMAL_MOOD(horse, 0);
 		AI::TASK_WANDER_IN_AREA(horse, s.x, s.y, s.z, 3.0f, 0.0f, 0.0f, FALSE);
+
+		int genderToApply = forceGender >= 0 ? forceGender : s.gender;
+		if (genderToApply == -2)
+		{
+			static int g_unknownGenderCounter = 0;
+			genderToApply = (g_unknownGenderCounter++ & 1);
+		}
+		if (genderToApply >= 0)
+		{
+			invoke<Void>(0x5653AB26C82938CF, horse, 0xA28B, (float)(genderToApply == 1 ? 0.0 : 1.0));
+			invoke<Void>(0xCC8CA3E88256E58F, horse, false, true, true, false, false);
+		}
 
 		ApplyPerfectHorseStats(horse);
 	}
@@ -814,37 +830,37 @@ static void LoadConfig()
 
 		if (enabled)
 		{
-		TonicEntry t1;
-		t1.name = "Aged Pirate Rum";
-		t1.itemHash = GAMEPLAY::GET_HASH_KEY("CONSUMABLE_AGED_PIRATE_RUM");
-		t1.enabled = enabled;
-		t1.price = price;
-		t1.displayName = "Aged Pirate Rum";
-		char buf1[32];
-		sprintf_s(buf1, "$%d,%02d", price / 100, price % 100);
-		t1.priceDisplay = buf1;
+		auto LoadTonicLocalized = [&](const char *itemLabel, const char *fallbackName, const char *itemHashStr) -> TonicEntry
+		{
+			TonicEntry t;
+			t.name = fallbackName;
+			t.itemHash = GAMEPLAY::GET_HASH_KEY(const_cast<char *>(itemHashStr));
+			t.enabled = enabled;
+			t.price = price;
+			char buf[32];
+			sprintf_s(buf, "$%d,%02d", price / 100, price % 100);
+			t.priceDisplay = buf;
+
+			if (invoke<BOOL>(0x73C258C68D6F55B6ull, itemLabel) == FALSE)
+			{
+				t.displayName = fallbackName;
+			}
+			else
+			{
+				const char *locText = invoke<const char *>(0xCFEDCCAD3C5BA90Dull, itemLabel);
+				string locName = TrimText(locText);
+				t.displayName = !locName.empty() ? locName : fallbackName;
+			}
+			return t;
+		};
+
+		TonicEntry t1 = LoadTonicLocalized("CONSUMABLE_AGED_PIRATE_RUM", "Aged Pirate Rum", "CONSUMABLE_AGED_PIRATE_RUM");
 		g_tonics.push_back(t1);
 
-		TonicEntry t2;
-		t2.name = "Ginseng Elixir";
-		t2.itemHash = GAMEPLAY::GET_HASH_KEY("CONSUMABLE_GINSENG_ELIXIER");
-		t2.enabled = enabled;
-		t2.price = price;
-		t2.displayName = "Ginseng Elixir";
-		char buf2[32];
-		sprintf_s(buf2, "$%d,%02d", price / 100, price % 100);
-		t2.priceDisplay = buf2;
+		TonicEntry t2 = LoadTonicLocalized("CONSUMABLE_GINSENG_ELIXIER", "Ginseng Elixir", "CONSUMABLE_GINSENG_ELIXIER");
 		g_tonics.push_back(t2);
 
-		TonicEntry t3;
-		t3.name = "Valerian Root";
-		t3.itemHash = GAMEPLAY::GET_HASH_KEY("CONSUMABLE_VALERIAN_ROOT");
-		t3.enabled = enabled;
-		t3.price = price;
-		t3.displayName = "Valerian Root";
-		char buf3[32];
-		sprintf_s(buf3, "$%d,%02d", price / 100, price % 100);
-		t3.priceDisplay = buf3;
+		TonicEntry t3 = LoadTonicLocalized("CONSUMABLE_VALERIAN_ROOT", "Valerian Root", "CONSUMABLE_VALERIAN_ROOT");
 		g_tonics.push_back(t3);
 
 		g_tonicsConfigLoaded = true;
@@ -872,7 +888,44 @@ static void LoadConfig()
 		size_t semicolon = valueLine.find(';');
 		if (semicolon != string::npos)
 		{
-			entry.displayName = Trim(valueLine.substr(0, semicolon));
+			string rawDisplayName = Trim(valueLine.substr(0, semicolon));
+
+			if (rawDisplayName.size() > 6 && rawDisplayName.compare(0, 6, "BREED_") == 0)
+			{
+				size_t parenOpen = rawDisplayName.find(" (");
+				size_t parenClose = rawDisplayName.find(')', parenOpen);
+				if (parenOpen != string::npos && parenClose != string::npos)
+				{
+					string breedKey = rawDisplayName.substr(6, parenOpen - 6);
+					string genderKey = rawDisplayName.substr(parenOpen + 2, parenClose - parenOpen - 2);
+
+					string breedLocalized = LocalizedBreedName(breedKey);
+					string genderLocalized = LocalizedGenderName(genderKey);
+
+					if (!breedLocalized.empty() && !genderLocalized.empty())
+					{
+						entry.displayName = breedLocalized + " (" + genderLocalized + ")";
+					}
+					else if (!breedLocalized.empty())
+					{
+						entry.displayName = breedLocalized;
+					}
+					else
+					{
+						entry.displayName = rawDisplayName;
+					}
+				}
+				else
+				{
+					string breedLocalized = LocalizedBreedName(rawDisplayName.substr(6));
+					entry.displayName = !breedLocalized.empty() ? breedLocalized : rawDisplayName;
+				}
+			}
+			else
+			{
+				entry.displayName = rawDisplayName;
+			}
+
 			string remainder = Trim(valueLine.substr(semicolon + 1));
 
 			size_t semicolon2 = remainder.find(';');
@@ -884,6 +937,7 @@ static void LoadConfig()
 				for (auto &c : lower) c = (char)tolower((unsigned char)c);
 				if (lower == "male") entry.gender = 1;
 				else if (lower == "female") entry.gender = 0;
+				else if (lower == "unknown") entry.gender = -2; // random gender
 
 				int multiplier = 1;
 				size_t starPos = rawPrice.find('*');
@@ -1189,6 +1243,8 @@ static void LoadConfig()
 						entry.gender = 1;
 					else if (lower == "female")
 						entry.gender = 0;
+					else if (lower == "unknown")
+						entry.gender = -2; // random gender
 				}
 			}
 			g_startSpawns.push_back(entry);
@@ -1418,9 +1474,12 @@ class MenuItemHorseSpawn : public MenuItemDefault
 			if (horse != 0)
 			{
 				PED::SET_PED_VISIBLE(horse, TRUE);
-				if (m_gender >= 0)
+				int genderToApply = m_gender;
+				if (genderToApply == -2)
+					genderToApply = (int)(GetTickCount64() & 1);
+				if (genderToApply >= 0)
 				{
-					invoke<Void>(0x5653AB26C82938CF, horse, 0xA28B, (float)(m_gender == 1 ? 0.0 : 1.0));
+					invoke<Void>(0x5653AB26C82938CF, horse, 0xA28B, (float)(genderToApply == 1 ? 0.0 : 1.0));
 					invoke<Void>(0xCC8CA3E88256E58F, horse, false, true, true, false, false);
 				}
 				ApplyPerfectHorseStats(horse);
@@ -1527,12 +1586,21 @@ static bool TonicShopEnabled()
 	return false;
 }
 
+static string LocalizedMenuTitle(const char *labelKey, const char *fallback)
+{
+	if (invoke<BOOL>(0x73C258C68D6F55B6ull, labelKey) == FALSE)
+		return fallback;
+	const char *text = invoke<const char *>(0xCFEDCCAD3C5BA90Dull, labelKey);
+	string locName = TrimText(text);
+	return !locName.empty() ? locName : fallback;
+}
+
 static MenuBase *CreateTonicMenu(MenuController *controller)
 {
 	if (!g_menuWidthCalculated)
 		CalculateMenuWidth();
 
-	auto menu = new MenuBase(new MenuItemHorseRustlerTitle("Tonics"));
+	auto menu = new MenuBase(new MenuItemHorseRustlerTitle(LocalizedMenuTitle("BUY_DRINK", "Tonics")));
 	controller->RegisterMenu(menu);
 
 	for (size_t i = 0; i < g_tonics.size(); i++)
@@ -2356,7 +2424,7 @@ void main()
 					for (size_t i = 0; i < spawnList.size(); i++)
 					{
 						auto &s = spawnList[i];
-						Ped horse = SpawnOneHorse(s);
+						Ped horse = SpawnOneHorse(s, s.gender);
 						if (horse != 0)
 							g_spawnedPeds.push_back({ s, horse, s.x, s.y, s.z, false, false, false, 0 });
 					}
@@ -2413,7 +2481,7 @@ void main()
 							}
 							if (group.size() > 1)
 								respawnEntry = g_startSpawns[group[rand() % group.size()]];
-							Ped horse = SpawnOneHorse(respawnEntry);
+							Ped horse = SpawnOneHorse(respawnEntry, respawnEntry.gender);
 							if (horse != 0)
 							{
 								sp.ped = horse;
@@ -2448,12 +2516,15 @@ void main()
 						}
 					}
 
-					if (!sp.genderApplied && sp.entry.gender >= 0)
+					if (!sp.genderApplied && (sp.entry.gender >= 0 || sp.entry.gender == -2))
 					{
 						sp.genderDelay++;
 						if (sp.genderDelay >= 10)
 						{
-							invoke<Void>(0x5653AB26C82938CF, sp.ped, 0xA28B, (float)(sp.entry.gender == 1 ? 0.0 : 1.0));
+							int genderToApply = sp.entry.gender;
+							if (genderToApply == -2)
+								genderToApply = (int)(GetTickCount64() & 1);
+							invoke<Void>(0x5653AB26C82938CF, sp.ped, 0xA28B, (float)(genderToApply == 1 ? 0.0 : 1.0));
 							invoke<Void>(0xCC8CA3E88256E58F, sp.ped, false, true, true, false, false);
 							sp.genderApplied = true;
 						}
@@ -3238,6 +3309,7 @@ static uint32_t Joaat(const char *s)
 }
 
 static const char *kOnlineModels[] = {
+	"A_C_HORSE_AMERICANSTANDARDBRED_LIGHTBUCKSKIN",
 	"A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE",
 	"A_C_HORSE_ARABIAN_GREY",
 	"A_C_HORSE_ARDENNES_IRONGREYROAN",
@@ -3555,6 +3627,13 @@ static string DefaultHorseName()
 	cached = TrimText(invoke<const char *>(0xCFEDCCAD3C5BA90Dull, "PLAYER_HORSE_NAME_DEFAULT"));
 	return cached;
 }
+static string LocalizedGenderName(const string &genderKey)
+{
+	if (invoke<BOOL>(0x73C258C68D6F55B6ull, genderKey.c_str()) == FALSE)
+		return string();
+	const char *text = invoke<const char *>(0xCFEDCCAD3C5BA90Dull, genderKey.c_str());
+	return TrimText(text);
+}
 static string ReadName(int slot)
 {
 	unsigned char buf[64] = {};
@@ -3817,7 +3896,7 @@ static void MaterializeActiveHorse()
 		return;
 	}
 	if (g_dryRun) return;
-	if (attempts >= 12) return;   // safety valve
+	if (attempts >= 12) return;
 
 	STREAMING::REQUEST_MODEL(om->hash, FALSE);
 	if (!STREAMING::HAS_MODEL_LOADED(om->hash)) return;
@@ -3949,6 +4028,7 @@ static void RetireMappedDonorPeds()
 static bool g_hud = true;
 struct HudCoat { const char *model; const char *coat; };
 static const HudCoat kCoats[] = {
+	{ "A_C_HORSE_AMERICANSTANDARDBRED_LIGHTBUCKSKIN", "COAT_LIGHTBUCKSKIN" },
 	{ "A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE", "COAT_BLACKSNO" },
 	{ "A_C_HORSE_ARABIAN_GREY", "COAT_GREY" },
 	{ "A_C_HORSE_ARDENNES_IRONGREYROAN", "COAT_IRONGREYR" },
@@ -4008,6 +4088,7 @@ static const char *CoatLabelFor(const string &modelName)
 
 struct HorseStat { const char *model; int health, stamina, speed, acc; const char *type; };
 static const HorseStat kStats[] = {
+	{ "A_C_HORSE_AMERICANSTANDARDBRED_LIGHTBUCKSKIN", 4, 4, 5, 4, "HORSE_CLASS_RACE" },
 	{ "A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE", 4, 5, 4, 4, "HORSE_CLASS_WORK" },
 	{ "A_C_HORSE_ARABIAN_GREY", 5, 5, 6, 6, "HORSE_CLASS_SUPERIOR" },
 	{ "A_C_HORSE_ARDENNES_IRONGREYROAN", 7, 5, 3, 3, "HORSE_CLASS_WAR" },
