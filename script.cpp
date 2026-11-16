@@ -1,4 +1,4 @@
-#include "script.h"
+﻿#include "script.h"
 #include "scriptmenu.h"
 #include "keyboard.h"
 
@@ -47,6 +47,7 @@ int g_perfectHorsesHealth = 0;
 int g_perfectHorsesStamina = 0;
 int g_perfectHorsesSpeed = 0;
 int g_perfectHorsesAcceleration = 0;
+int g_apocalypseVisuals = 1;
 
 struct ApocalypseModelInfo
 {
@@ -55,6 +56,7 @@ struct ApocalypseModelInfo
 };
 struct ApocalypseHorseEntry
 {
+	string name;
 	vector<ApocalypseModelInfo> models;
 	vector<string> requiredNames;
 
@@ -222,6 +224,20 @@ static string TrimText(const char *text);
 static string LocalizedBreedName(const string &suffix);
 static string LocalizedGenderName(const string &genderKey);
 static string LocalizedMenuTitle(const char *labelKey, const char *fallback);
+static bool ApocalypseEntryMatchesHorse(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
+{
+	if (!entry.MatchesModel(modelHash)) return false;
+
+	int genderRequired = entry.GetGenderRequired(modelHash);
+	if (genderRequired >= 0)
+	{
+		float exprValue = invoke<float>(0xFD1BA1EEF7985BB8, horse, 0xA28B);
+		int horseGender = (exprValue < 0.5f) ? 1 : 0;
+		if (horseGender != genderRequired) return false;
+	}
+	return PedNicknameMatches(entry, horse);
+}
+
 static bool IsApocalypseHorse(Ped horse)
 {
 	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
@@ -230,20 +246,7 @@ static bool IsApocalypseHorse(Ped horse)
 	DWORD modelHash = ResolveApocalypseHorseModel(horse, visibleModel);
 
 	for (size_t i = 0; i < g_apocalypseHorses.size(); i++)
-	{
-		const ApocalypseHorseEntry &entry = g_apocalypseHorses[i];
-		if (!entry.MatchesModel(modelHash)) continue;
-
-		int genderRequired = entry.GetGenderRequired(modelHash);
-		if (genderRequired >= 0)
-		{
-			float exprValue = invoke<float>(0xFD1BA1EEF7985BB8, horse, 0xA28B);
-			int horseGender = (exprValue < 0.5f) ? 1 : 0;
-			if (horseGender != genderRequired) continue;
-		}
-		if (!PedNicknameMatches(entry, horse)) continue;
-		return true;
-	}
+		if (ApocalypseEntryMatchesHorse(g_apocalypseHorses[i], horse, modelHash)) return true;
 
 	return false;
 }
@@ -690,6 +693,7 @@ static void LoadKeysFromIni(const string &iniPath)
 	g_perfectHorsesStamina = 0;
 	g_perfectHorsesSpeed = 0;
 	g_perfectHorsesAcceleration = 0;
+	g_apocalypseVisuals = GetPrivateProfileIntA("ApocalypseHorses", "CustomVisuals", 1, iniPath.c_str());
 	g_apocalypseHorses.clear();
 
 	char perfectHorsesBuf[256];
@@ -732,6 +736,7 @@ static void LoadKeysFromIni(const string &iniPath)
 		if (modelListStr.empty()) continue;
 
 		ApocalypseHorseEntry entry;
+		entry.name = apocalypseHorseNames[i];
 		stringstream modelStream(modelListStr);
 		string modelToken;
 		while (getline(modelStream, modelToken, '|'))
@@ -2268,16 +2273,16 @@ void main()
 			{
 				struct SpecialKey { int vk; char normal; char shifted; };
 					static const SpecialKey specialKeys[] = {
-						{0xBF, '?', '/'},   // OEM_2
-						{0xDE, '\'', '"'},   // OEM_7
-						{0xBC, ',', '<'},    // OEM_COMMA
-						{0xBE, '.', '>'},    // OEM_PERIOD
-						{0xBD, '-', '_'},    // OEM_MINUS
-						{0xBA, ';', ':'},    // OEM_1
-						{0xC0, '`', '~'},    // OEM_3
-						{0xDB, '[', '{'},    // OEM_4
-						{0xDD, ']', '}'},    // OEM_5
-						{0xDC, '\\', '|'},   // OEM_102
+						{0xBF, '?', '/'},  // OEM_2
+						{0xDE, '\'', '"'}, // OEM_7
+						{0xBC, ',', '<'},  // OEM_COMMA
+						{0xBE, '.', '>'},  // OEM_PERIOD
+						{0xBD, '-', '_'},  // OEM_MINUS
+						{0xBA, ';', ':'},  // OEM_1
+						{0xC0, '`', '~'},  // OEM_3
+						{0xDB, '[', '{'},  // OEM_4
+						{0xDD, ']', '}'},  // OEM_5
+						{0xDC, '\\', '|'}, // OEM_102
 					};
 					for (const auto &sk : specialKeys)
 					{
@@ -4491,6 +4496,367 @@ static void ApplyStableHudSafe(bool inMenu)
 	}
 }
 
+enum CoatTagType { coat, scale };
+
+struct CoatTag
+{
+    CoatTagType type;
+    DWORD drawable, albedo, normal, material, palette;
+    int tint0, tint1, tint2;
+    float scaleValue;
+
+    CoatTag(CoatTagType tagType, float value)
+        : type(tagType), drawable(0), albedo(0), normal(0), material(0), palette(0),
+          tint0(0), tint1(0), tint2(0), scaleValue(value) {}
+
+    CoatTag(DWORD d, DWORD a, DWORD n, DWORD m)
+        : type(coat), drawable(d), albedo(a), normal(n), material(m), palette(0),
+          tint0(0), tint1(0), tint2(0), scaleValue(0.0f) {}
+
+    CoatTag(DWORD d, DWORD a, DWORD n, DWORD m, DWORD p, int t0, int t1, int t2)
+        : type(coat), drawable(d), albedo(a), normal(n), material(m), palette(p),
+          tint0(t0), tint1(t1), tint2(t2), scaleValue(0.0f) {}
+};
+
+struct CoatSet { const char *owner; DWORD model; const CoatTag *modded; int nModded; const CoatTag *vanilla; int nVanilla; };
+
+static const CoatTag kCoat_arabian_black_Vanilla[] = {
+    { scale, 0.91875000f },
+	{ 0x3E83CEA8, 0x2B5C884B, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 21, 195, 132 },
+	{ 0x4A4A3A1A, 0xA1AC42C9, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 21, 138, 138 },
+};
+static const CoatTag kCoat_arabian_black_Modded[] = {
+    { scale, 0.94666666f },
+	{ 0x3E83CEA8, 0x2B5C884B, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 138, 138, 138 },
+	{ 0x4A4A3A1A, 0xA1AC42C9, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 138, 138, 138 },
+};
+static const CoatTag kCoat_arabian_redchestnut_Vanilla[] = {
+    { scale, 0.91875000f },
+	{ 0x3E83CEA8, 0x686891C5, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 176, 176, 136 },
+	{ 0x4A4A3A1A, 0x3C3834FD, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 176, 176, 114 },
+};
+static const CoatTag kCoat_arabian_redchestnut_Modded[] = {
+    { scale, 0.94666666f },
+	{ 0x3E83CEA8, 0x686891C5, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 176, 176, 138 },
+	{ 0x4A4A3A1A, 0x3C3834FD, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 176, 176, 138 },
+};
+static const CoatTag kCoat_arabian_white_Vanilla[] = {
+    { scale, 0.91875000f },
+	{ 0x3E83CEA8, 0x748FF64F, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 18, 1, 5 },
+	{ 0x4A4A3A1A, 0xD24DD595, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 18, 1, 6 },
+};
+static const CoatTag kCoat_arabian_white_Modded[] = {
+    { scale, 0.94666666f },
+	{ 0x3E83CEA8, 0x748FF64F, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 18, 1, 5 },
+	{ 0x4A4A3A1A, 0xD24DD595, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 18, 1, 6 },
+};
+static const CoatTag kCoat_kentuckysaddle_black_Vanilla[] = {
+	{ 0x3E83CEA8, 0x9ED04A50, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 138, 0, 197 },
+	{ 0x4A4A3A1A, 0x4D96CB3A, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 138, 0, 172 },
+};
+static const CoatTag kCoat_kentuckysaddle_black_Modded[] = {
+	{ 0x3E83CEA8, 0x9ED04A50, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 138, 138, 138 },
+	{ 0x4A4A3A1A, 0x4D96CB3A, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 138, 138, 138 },
+};
+static const CoatTag kCoat_mustang_wildbay_Vanilla[] = {
+    { scale, 0.93750000f },
+	{ 0xB45BC8BF, 0x25D15B14, 0xB283DA4F, 0x1CA4EAA6 },
+};
+static const CoatTag kCoat_mustang_wildbay_Modded[] = {
+    { scale, 0.94666666f },
+	{ 0xB45BC8BF, 0x74791D3A, 0xB283DA4F, 0x1CA4EAA6 },
+};
+static const CoatTag kCoat_norfolkroadster_black_Vanilla[] = {
+	{ 0x8591E73A, 0x27E50F8A, 0x59FA709B, 0x700BF538, 0xA4041CEF, 138, 18, 197 },
+	{ 0x53A5483F, 0x62056C46, 0xAAB5F570, 0x508981E0, 0xA4041CEF, 138, 18, 138 },
+};
+static const CoatTag kCoat_norfolkroadster_black_Modded[] = {
+	{ 0x8591E73A, 0x27E50F8A, 0x59FA709B, 0x700BF538, 0xA4041CEF, 138, 138, 138 },
+	{ 0x53A5483F, 0x62056C46, 0xAAB5F570, 0x508981E0, 0xA4041CEF, 138, 138, 138 },
+};
+static const CoatTag kCoat_turkoman_black_Vanilla[] = {
+	{ 0x8591E73A, 0xD7DDE492, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 138, 195, 0 },
+	{ 0x53A5483F, 0xE364BEC6, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 138, 195, 8 },
+};
+static const CoatTag kCoat_turkoman_black_Modded[] = {
+	{ 0x8591E73A, 0xD7DDE492, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 138, 138, 138 },
+	{ 0x53A5483F, 0xE364BEC6, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 138, 138, 138 },
+};
+static const CoatTag kCoat_shire_ravenblack_Vanilla[] = {
+	{ 0xB45BC8BF, 0x25D15B14, 0xB283DA4F, 0x1CA4EAA6 },
+	{ 0x3E83CEA8, 0xEBFD74C8, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 21, 195, 138 },
+	{ 0x4A4A3A1A, 0x110F0797, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 138, 138, 138 },
+};
+static const CoatTag kCoat_shire_ravenblack_Modded[] = {
+	{ 0xB45BC8BF, 0x74791D3A, 0xB283DA4F, 0x1CA4EAA6 },
+	{ 0x3E83CEA8, 0xEBFD74C8, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 138, 138, 138 },
+	{ 0x4A4A3A1A, 0x110F0797, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 138, 138, 138 },
+};
+static const CoatTag kCoat_suffolkpunch_redchestnut_Vanilla[] = {
+	{ 0x3E83CEA8, 0xEBFD74C8, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 201, 194, 134 },
+	{ 0x4A4A3A1A, 0x110F0797, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 201, 68, 207 },
+	{ 0x434D6D13, 0x0B940125, 0xE205E86E, 0x74C75769, 0xA4041CEF, 188, 188, 188 },
+	{ 0xA90EBD77, 0x0B940125, 0xE205E86E, 0x74C75769, 0xA4041CEF, 188, 188, 188 },
+	{ 0x1E1A542F, 0xA178B8E5, 0x8B41FFE8, 0x8662582C, 0xA4041CEF, 188, 188, 188 },
+};
+static const CoatTag kCoat_suffolkpunch_redchestnut_Modded[] = {
+	{ 0x3E83CEA8, 0x686891C5, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 158, 158, 138 },
+	{ 0x4A4A3A1A, 0x3C3834FD, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 158, 158, 138 },
+	{ 0x434D6D13, 0x0B940125, 0xE205E86E, 0x74C75769, 0xA4041CEF, 138, 138, 138 },
+	{ 0xA90EBD77, 0x0B940125, 0xE205E86E, 0x74C75769, 0xA4041CEF, 138, 138, 138 },
+	{ 0x1E1A542F, 0xA178B8E5, 0x8B41FFE8, 0x8662582C, 0xA4041CEF, 138, 138, 138 },
+};
+
+static const CoatSet kCoatSets[] = {
+	{ "Death", 0x7E4DF66E, kCoat_mustang_wildbay_Modded, (int)(sizeof(kCoat_mustang_wildbay_Modded) / sizeof(CoatTag)), kCoat_mustang_wildbay_Vanilla, (int)(sizeof(kCoat_mustang_wildbay_Vanilla) / sizeof(CoatTag)) },
+	{ "Famine", 0x88D6A59E, kCoat_arabian_black_Modded, (int)(sizeof(kCoat_arabian_black_Modded) / sizeof(CoatTag)), kCoat_arabian_black_Vanilla, (int)(sizeof(kCoat_arabian_black_Vanilla) / sizeof(CoatTag)) },
+	{ "Famine", 0xF1430568, kCoat_kentuckysaddle_black_Modded, (int)(sizeof(kCoat_kentuckysaddle_black_Modded) / sizeof(CoatTag)), kCoat_kentuckysaddle_black_Vanilla, (int)(sizeof(kCoat_kentuckysaddle_black_Vanilla) / sizeof(CoatTag)) },
+	{ "Famine", 0x3C0E4E87, kCoat_norfolkroadster_black_Modded, (int)(sizeof(kCoat_norfolkroadster_black_Modded) / sizeof(CoatTag)), kCoat_norfolkroadster_black_Vanilla, (int)(sizeof(kCoat_norfolkroadster_black_Vanilla) / sizeof(CoatTag)) },
+	{ "Famine", 0x88828382, kCoat_turkoman_black_Modded, (int)(sizeof(kCoat_turkoman_black_Modded) / sizeof(CoatTag)), kCoat_turkoman_black_Vanilla, (int)(sizeof(kCoat_turkoman_black_Vanilla) / sizeof(CoatTag)) },
+	{ "Famine", 0x2FD9844A, kCoat_shire_ravenblack_Modded, (int)(sizeof(kCoat_shire_ravenblack_Modded) / sizeof(CoatTag)), kCoat_shire_ravenblack_Vanilla, (int)(sizeof(kCoat_shire_ravenblack_Vanilla) / sizeof(CoatTag)) },
+	{ "Pestilence", 0xC8DA3400, kCoat_arabian_white_Modded, (int)(sizeof(kCoat_arabian_white_Modded) / sizeof(CoatTag)), kCoat_arabian_white_Vanilla, (int)(sizeof(kCoat_arabian_white_Vanilla) / sizeof(CoatTag)) },
+	{ "War", 0xA52D4FC0, kCoat_arabian_redchestnut_Modded, (int)(sizeof(kCoat_arabian_redchestnut_Modded) / sizeof(CoatTag)), kCoat_arabian_redchestnut_Vanilla, (int)(sizeof(kCoat_arabian_redchestnut_Vanilla) / sizeof(CoatTag)) },
+	{ "War", 0x9B099788, kCoat_suffolkpunch_redchestnut_Modded, (int)(sizeof(kCoat_suffolkpunch_redchestnut_Modded) / sizeof(CoatTag)), kCoat_suffolkpunch_redchestnut_Vanilla, (int)(sizeof(kCoat_suffolkpunch_redchestnut_Vanilla) / sizeof(CoatTag)) },
+};
+
+struct CoatState { Ped ped; DWORD model; bool modded; DWORD lastApplied; };
+static vector<CoatState> g_coatStates;
+
+// Flag 207 is the game's built-in "Flaming Hooves Active" ped config flag.
+// The effect is native to RDR2/RDO; no custom particle dictionary is needed.
+struct FlamingHoovesState { Ped ped; DWORD model; };
+static vector<FlamingHoovesState> g_flamingHoovesStates;
+
+static bool IsWarApocalypseHorse(Ped ped, DWORD model)
+{
+    if (ped == 0 || !ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped))
+        return false;
+
+    for (size_t i = 0; i < g_apocalypseHorses.size(); ++i)
+    {
+        const ApocalypseHorseEntry &entry = g_apocalypseHorses[i];
+        if (entry.name == "War" && ApocalypseEntryMatchesHorse(entry, ped, model))
+            return true;
+    }
+    return false;
+}
+
+static void SetFlamingHooves(Ped ped, bool enabled)
+{
+    invoke<Void>(0x1913FE4CBF41C463ull, ped, 207, enabled);
+}
+
+static void UpdateApocalypseFlamingHooves()
+{
+    // Remove the flag from horses that no longer satisfy War's model/name/gender requirements, and discard handles that have been despawned.
+    for (size_t i = 0; i < g_flamingHoovesStates.size();)
+    {
+        Ped ped = g_flamingHoovesStates[i].ped;
+        if (!ENTITY::DOES_ENTITY_EXIST(ped))
+        {
+            g_flamingHoovesStates.erase(g_flamingHoovesStates.begin() + i);
+            continue;
+        }
+
+        DWORD model = (DWORD)ENTITY::GET_ENTITY_MODEL(ped);
+        if (model != g_flamingHoovesStates[i].model ||
+            !IsWarApocalypseHorse(ped, model))
+        {
+            SetFlamingHooves(ped, false);
+            g_flamingHoovesStates.erase(g_flamingHoovesStates.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+
+    // Include the active mount explicitly; stable/camera scenes can omit it from GET_PED_NEARBY_PEDS.
+    Ped candidates[33];
+    int candidateCount = 0;
+    Ped playerPed = PLAYER::PLAYER_PED_ID();
+    if (!ENTITY::DOES_ENTITY_EXIST(playerPed)) return;
+
+    Ped mount = PED::GET_MOUNT(playerPed);
+    if (mount && ENTITY::DOES_ENTITY_EXIST(mount))
+        candidates[candidateCount++] = mount;
+
+    int buf[32 + 1]; buf[0] = 32;
+    int count = PED::GET_PED_NEARBY_PEDS(playerPed, buf, -1, -1);
+    for (int i = 0; i < count && i < 32 && candidateCount < 33; ++i)
+    {
+        Ped nearby = (Ped)buf[i + 1];
+        if (!nearby || !ENTITY::DOES_ENTITY_EXIST(nearby)) continue;
+        bool duplicate = false;
+        for (int j = 0; j < candidateCount; ++j)
+            if (candidates[j] == nearby) { duplicate = true; break; }
+        if (!duplicate) candidates[candidateCount++] = nearby;
+    }
+
+    for (int i = 0; i < candidateCount; ++i)
+    {
+        Ped ped = candidates[i];
+        if (!ENTITY::DOES_ENTITY_EXIST(ped)) continue;
+        DWORD model = (DWORD)ENTITY::GET_ENTITY_MODEL(ped);
+        if (!IsWarApocalypseHorse(ped, model)) continue;
+
+        bool tracked = false;
+        for (size_t j = 0; j < g_flamingHoovesStates.size(); ++j)
+        {
+            if (g_flamingHoovesStates[j].ped == ped && g_flamingHoovesStates[j].model == model)
+            {
+                tracked = true;
+                break;
+            }
+        }
+        // Reassert the flag periodically in case a stable interaction or component refresh resets the ped config flags.
+        SetFlamingHooves(ped, true);
+        if (!tracked)
+        {
+            FlamingHoovesState state = { ped, model };
+            g_flamingHoovesStates.push_back(state);
+        }
+    }
+}
+
+static const CoatSet *FindCoatSet(DWORD model, const char *owner = nullptr)
+{
+	for (size_t i = 0; i < sizeof(kCoatSets) / sizeof(kCoatSets[0]); i++)
+		if (kCoatSets[i].model == model && (!owner || strcmp(kCoatSets[i].owner, owner) == 0)) return &kCoatSets[i];
+	return nullptr;
+}
+
+static float FindCoatScale(const CoatTag *tags, int n)
+{
+    for (int i = 0; i < n; ++i)
+        if (tags[i].type == scale && tags[i].scaleValue > 0.0f)
+            return tags[i].scaleValue;
+    return 0.0f;
+}
+
+static void ApplyCoatTags(Ped ped, const CoatTag *tags, int n,
+                          const CoatTag *vanillaTags, int nVanilla)
+{
+    const float vanillaScale = FindCoatScale(vanillaTags, nVanilla);
+
+    for (int i = 0; i < n; ++i)
+    {
+        if (tags[i].type == scale)
+        {
+            if (vanillaScale > 0.0f && tags[i].scaleValue > 0.0f)
+                invoke<Void>(0x25ACFC650B65C538, ped, tags[i].scaleValue / vanillaScale);
+            continue;
+        }
+
+        invoke<Void>(0xBC6DF00D7A4A6819, ped, tags[i].drawable, tags[i].albedo,
+                     tags[i].normal, tags[i].material, tags[i].palette,
+                     tags[i].tint0, tags[i].tint1, tags[i].tint2);
+    }
+
+    invoke<Void>(0xCC8CA3E88256E58F, ped, false, true, true, false, false);
+}
+
+static void ApplyApocalypseVisuals()
+{
+	static DWORD last = 0;
+	DWORD now = GetTickCount();
+	if (now - last < 500) return;
+	last = now;
+
+    // Enable the game's native flaming-hooves effect on eligible War horses.
+    UpdateApocalypseFlamingHooves();
+
+	for (size_t i = 0; i < g_coatStates.size();)
+	{
+		if (!ENTITY::DOES_ENTITY_EXIST(g_coatStates[i].ped)) g_coatStates.erase(g_coatStates.begin() + i);
+		else i++;
+	}
+
+	// Include the player's current mount explicitly. Some stable/shop scenes do not consistently return the mount in GET_PED_NEARBY_PEDS.
+	Ped candidates[33];
+	int candidateCount = 0;
+	Ped playerPed = PLAYER::PLAYER_PED_ID();
+	if (!ENTITY::DOES_ENTITY_EXIST(playerPed)) return;
+	{
+		Ped mount = PED::GET_MOUNT(playerPed);
+		if (mount != 0 && ENTITY::DOES_ENTITY_EXIST(mount))
+			candidates[candidateCount++] = mount;
+	}
+
+	int buf[32 + 1]; buf[0] = 32;
+	int count = PED::GET_PED_NEARBY_PEDS(playerPed, buf, -1, -1);
+	for (int i = 0; i < count && i < 32 && candidateCount < 33; i++)
+	{
+		Ped nearby = (Ped)buf[i + 1];
+		if (nearby == 0 || !ENTITY::DOES_ENTITY_EXIST(nearby)) continue;
+		bool duplicate = false;
+		for (int j = 0; j < candidateCount; j++)
+			if (candidates[j] == nearby) { duplicate = true; break; }
+		if (!duplicate) candidates[candidateCount++] = nearby;
+	}
+
+	for (int i = 0; i < candidateCount; i++)
+	{
+		Ped ped = candidates[i];
+		if (!ENTITY::DOES_ENTITY_EXIST(ped)) continue;
+
+		DWORD model = (DWORD)ENTITY::GET_ENTITY_MODEL(ped);
+
+		if (!FindCoatSet(model)) continue;
+
+		bool want = false;
+		if (g_apocalypseVisuals != 0 && !ENTITY::IS_ENTITY_DEAD(ped))
+		{
+			for (size_t e = 0; e < g_apocalypseHorses.size() && !want; e++)
+			{
+				const ApocalypseHorseEntry &entry = g_apocalypseHorses[e];
+				const CoatSet *cs = FindCoatSet(model, entry.name.c_str());
+				if (!cs) continue;
+				if (ApocalypseEntryMatchesHorse(entry, ped, model)) want = true;
+			}
+		}
+
+		int idx = -1;
+		for (size_t k = 0; k < g_coatStates.size(); k++)
+			if (g_coatStates[k].ped == ped && g_coatStates[k].model == model) { idx = (int)k; break; }
+
+		if (idx < 0 && !want) continue;
+
+		// The stable can rebuild a horse's components when its UI closes.
+		// Re-apply modded visuals periodically even when our logical state
+		// has not changed, otherwise the cache would hide the game's reset.
+		if (idx >= 0 && g_coatStates[idx].modded == want)
+		{
+			if (!want || now - g_coatStates[idx].lastApplied < 1000)
+				continue;
+		}
+
+		const CoatSet *cs = FindCoatSet(model);
+		if (want)
+		{
+			for (size_t e = 0; e < g_apocalypseHorses.size(); e++)
+			{
+				const CoatSet *c2 = FindCoatSet(model, g_apocalypseHorses[e].name.c_str());
+				if (c2 && ApocalypseEntryMatchesHorse(g_apocalypseHorses[e], ped, model)) { cs = c2; break; }
+			}
+			ApplyCoatTags(ped, cs->modded, cs->nModded, cs->vanilla, cs->nVanilla);
+		}
+		else
+		{
+			ApplyCoatTags(ped, cs->vanilla, cs->nVanilla, cs->vanilla, cs->nVanilla);
+		}
+
+		if (idx >= 0)
+		{
+			g_coatStates[idx].modded = want;
+			g_coatStates[idx].lastApplied = now;
+		}
+		else
+		{
+			CoatState st = { ped, model, want, now };
+			g_coatStates.push_back(st);
+		}
+	}
+}
+
 static bool g_stats = true;
 static void ApplyOnlineStats()
 {
@@ -4666,6 +5032,7 @@ void OnlineHorses_Tick(bool nearStable)
 	RetireDonorActiveHorse();
 	RetireMappedDonorPeds();
 	ApplyOnlineStats();
+	ApplyApocalypseVisuals();
 	ApplyStableHudSafe(g_donorMode && !gameCam);
 }
 
