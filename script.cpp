@@ -21,6 +21,11 @@ void SniperHook_Shutdown();
 
 void OnlineHorses_Init(const char *iniPath);
 void OnlineHorses_Tick(bool nearStable);
+static void BountyFreeRoam_Tick();
+static void NoForcedHolstering_Tick();
+static void StableNpcCalm_Tick();
+static void BlanketRemover_Tick();
+static bool StableShopUiActive();
 void OnlineHorses_Shutdown();
 static bool IsFaceCovered(Ped ped);
 
@@ -40,7 +45,9 @@ int g_fog_of_War = 0;
 int g_scanner = 0;
 int g_kmh = 0;
 int g_clear_All_Bounties_and_Lockdown_Areas = 0;
+int g_noForcedHolstering = 0;
 int g_autoRename = 0;
+int g_blanketRemover = 0;
 
 int g_perfectHorses = 0;
 int g_perfectHorsesHealth = 0;
@@ -224,6 +231,7 @@ static string TrimText(const char *text);
 static string LocalizedBreedName(const string &suffix);
 static string LocalizedGenderName(const string &genderKey);
 static string LocalizedMenuTitle(const char *labelKey, const char *fallback);
+static bool StableShopUiActive();
 static bool ApocalypseEntryMatchesHorse(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
 {
 	if (!entry.MatchesModel(modelHash)) return false;
@@ -238,6 +246,27 @@ static bool ApocalypseEntryMatchesHorse(const ApocalypseHorseEntry &entry, Ped h
 	return PedNicknameMatches(entry, horse);
 }
 
+static bool ApocalypseEntryMatchesModelGender(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
+{
+	if (!entry.MatchesModel(modelHash)) return false;
+
+	int genderRequired = entry.GetGenderRequired(modelHash);
+	if (genderRequired >= 0)
+	{
+		float exprValue = invoke<float>(0xFD1BA1EEF7985BB8, horse, 0xA28B);
+		int horseGender = (exprValue < 0.5f) ? 1 : 0;
+		if (horseGender != genderRequired) return false;
+	}
+	return true;
+}
+
+static bool ApocalypseEntryMatchesContext(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
+{
+	if (ApocalypseEntryMatchesHorse(entry, horse, modelHash)) return true;
+	if (!StableShopUiActive()) return false;
+	return ApocalypseEntryMatchesModelGender(entry, horse, modelHash);
+}
+
 static bool IsApocalypseHorse(Ped horse)
 {
 	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
@@ -246,7 +275,7 @@ static bool IsApocalypseHorse(Ped horse)
 	DWORD modelHash = ResolveApocalypseHorseModel(horse, visibleModel);
 
 	for (size_t i = 0; i < g_apocalypseHorses.size(); i++)
-		if (ApocalypseEntryMatchesHorse(g_apocalypseHorses[i], horse, modelHash)) return true;
+		if (ApocalypseEntryMatchesContext(g_apocalypseHorses[i], horse, modelHash)) return true;
 
 	return false;
 }
@@ -686,6 +715,8 @@ static void LoadKeysFromIni(const string &iniPath)
 	g_scanner = GetPrivateProfileIntA("Config", "Scanner", 0, iniPath.c_str());
 	g_kmh = GetPrivateProfileIntA("Config", "KMH", 0, iniPath.c_str());
 	g_clear_All_Bounties_and_Lockdown_Areas = GetPrivateProfileIntA("Config", "Clear_All_Bounties_and_Lockdown_Areas", 0, iniPath.c_str());
+	g_noForcedHolstering = GetPrivateProfileIntA("Config", "No_Forced_Holstering", 0, iniPath.c_str());
+	g_blanketRemover = GetPrivateProfileIntA("Config", "Blanket_Remover", 0, iniPath.c_str());
 
 	g_autoRename = GetPrivateProfileIntA("Config", "AutoRename", 0, iniPath.c_str());
 	g_perfectHorses = 0;
@@ -763,7 +794,7 @@ static void LoadKeysFromIni(const string &iniPath)
 			entry.models.push_back(mi);
 		}
 		if (horseKey == "DeathHorse") entry.requiredNames = vector<string>{ "Death", "Death Horse", "Morte" };
-		else if (horseKey == "FamineHorse") entry.requiredNames = vector<string>{ "Famine", "Famine Horse", "Fome" };
+		else if (horseKey == "FamineHorse") entry.requiredNames = vector<string>{ "Famine", "Famine Horse", "Fome", "Faminto" };
 		else if (horseKey == "PestilenceHorse") entry.requiredNames = vector<string>{ "Pestilence", "Pestilence Horse", "Peste" };
 		else if (horseKey == "WarHorse") entry.requiredNames = vector<string>{ "War", "War Horse", "Guerra" };
 		if (entry.models.empty()) continue;
@@ -2780,60 +2811,9 @@ void main()
 			}
 		}
 
-		if (g_clear_All_Bounties_and_Lockdown_Areas != 0)
-		{
-			Ped playerPed = PLAYER::PLAYER_PED_ID();
-			Player player = PLAYER::PLAYER_ID();
-			if (ENTITY::DOES_ENTITY_EXIST(playerPed) && PLAYER::IS_PLAYER_PLAYING(player))
-			{
-				bool hasBandana = IsFaceCovered(playerPed);
-
-				SniperHook_SetDisguised(hasBandana);
-
-				if (hasBandana)
-				{
-					PLAYER::SET_MAX_WANTED_LEVEL(0);
-					PLAYER::RESET_WANTED_LEVEL_DIFFICULTY(player);
-					MAPREGION::_0xBE551C2CC421185D(0x41759831, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0xD69B5B49, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x5647E155, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x129E1411, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x0E95FF51, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x763A8A87, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x33D88587, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x99B6A1E6, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x8966022D, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x3AC128F9, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x27253ED3, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0x5046DD11, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0xD428627B, FALSE);
-					MAPREGION::_0xBE551C2CC421185D(0xFAF570C5, FALSE);
-				}
-				else
-				{
-					PLAYER::SET_MAX_WANTED_LEVEL(5);
-					PLAYER::SET_WANTED_LEVEL_MULTIPLIER(1.0f);
-					MAPREGION::_0xBE551C2CC421185D(0x41759831, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0xD69B5B49, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x5647E155, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x129E1411, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x0E95FF51, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x763A8A87, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x33D88587, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x99B6A1E6, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x8966022D, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x3AC128F9, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x27253ED3, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0x5046DD11, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0xD428627B, TRUE);
-					MAPREGION::_0xBE551C2CC421185D(0xFAF570C5, TRUE);
-				}
-			}
-		}
-		else
-		{
-			SniperHook_SetDisguised(false);
-		}
+		BountyFreeRoam_Tick();
+		NoForcedHolstering_Tick();
+		StableNpcCalm_Tick();
 
 		if (g_fog_of_War != 0)
 			RADAR::_SET_MINIMAP_REVEALED(TRUE);
@@ -2958,6 +2938,8 @@ void main()
 			OnlineHorses_Tick(_si >= 0);
 		}
 
+		BlanketRemover_Tick();
+
 		WAIT(0);
 	}
 }
@@ -2966,6 +2948,439 @@ void ScriptMain()
 {
 	srand(GetTickCount());
 	main();
+}
+
+
+static uint32_t NFH_Joaat(const char *s)
+{
+	uint32_t h = 0;
+	for (; *s; ++s)
+	{
+		char c = *s; if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+		h += (uint8_t)c; h += h << 10; h ^= h >> 6;
+	}
+	h += h << 3; h ^= h >> 11; h += h << 15;
+	return h;
+}
+
+static bool NFH_IsFirearm(DWORD w)
+{
+	static const char *kNames[] = {
+		"WEAPON_RIFLE_BOLTACTION", "WEAPON_RIFLE_SPRINGFIELD", "WEAPON_RIFLE_ELEPHANT", "WEAPON_RIFLE_VARMINT",
+		"WEAPON_REPEATER_CARBINE", "WEAPON_REPEATER_WINCHESTER", "WEAPON_REPEATER_HENRY", "WEAPON_REPEATER_EVANS",
+		"WEAPON_SHOTGUN_DOUBLEBARREL", "WEAPON_SHOTGUN_DOUBLEBARREL_EXOTIC", "WEAPON_SHOTGUN_PUMP",
+		"WEAPON_SHOTGUN_REPEATING", "WEAPON_SHOTGUN_SAWEDOFF", "WEAPON_SHOTGUN_SEMIAUTO",
+		"WEAPON_SNIPERRIFLE_ROLLINGBLOCK", "WEAPON_SNIPERRIFLE_ROLLINGBLOCK_EXOTIC", "WEAPON_SNIPERRIFLE_CARCANO",
+		"WEAPON_REVOLVER_CATTLEMAN", "WEAPON_REVOLVER_CATTLEMAN_MEXICAN", "WEAPON_REVOLVER_DOUBLEACTION",
+		"WEAPON_REVOLVER_DOUBLEACTION_EXOTIC", "WEAPON_REVOLVER_DOUBLEACTION_GAMBLER", "WEAPON_REVOLVER_LEMAT",
+		"WEAPON_REVOLVER_SCHOFIELD", "WEAPON_REVOLVER_NAVY", "WEAPON_REVOLVER_NAVY_CROSSOVER",
+		"WEAPON_PISTOL_MAUSER", "WEAPON_PISTOL_MAUSER_DRUNK", "WEAPON_PISTOL_SEMIAUTO", "WEAPON_PISTOL_VOLCANIC",
+		"WEAPON_REPEATER_CARBINE_SADIE", "WEAPON_RIFLE_BOLTACTION_EXOTIC",
+		"WEAPON_BOW", "WEAPON_BOW_IMPROVED"
+	};
+	static uint32_t hashes[sizeof(kNames) / sizeof(kNames[0])];
+	static bool init = false;
+	if (!init)
+	{
+		for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); i++) hashes[i] = NFH_Joaat(kNames[i]);
+		init = true;
+	}
+	for (size_t i = 0; i < sizeof(hashes) / sizeof(hashes[0]); i++)
+		if (hashes[i] == (uint32_t)w) return true;
+	return false;
+}
+
+static bool NFH_IsLongarm(DWORD w)
+{
+	static uint32_t bow = NFH_Joaat("WEAPON_BOW"), bowImproved = NFH_Joaat("WEAPON_BOW_IMPROVED");
+	if (w == 0) return false;
+	if (w == bow || w == bowImproved) return true;
+	if (NFH_IsFirearm(w)) return true;
+	return invoke<int>(0x0556E9D2ECF39D01, w) != 0;
+}
+
+static void NFH_ReadBack(Ped ped, DWORD out[4], DWORD unarmed)
+{
+	for (int i = 0; i < 4; i++)
+	{
+		Hash h = 0;
+		WEAPON::GET_CURRENT_PED_WEAPON(ped, &h, FALSE, 7 + i, FALSE);
+		out[i] = (h == (Hash)unarmed) ? 0 : (DWORD)h;
+	}
+}
+
+static bool NFH_InList(const DWORD *arr, int n, DWORD w)
+{
+	for (int i = 0; i < n; i++) if (arr[i] == w) return true;
+	return false;
+}
+
+static void NoForcedHolstering_Tick()
+{
+	static bool  s_applied = false;
+	static DWORD s_heldWeapon = 0, s_heldSeen = 0;
+	static DWORD s_lastIntent = 0, s_lastTry = 0, s_lastCfg = 0, s_mountedSince = 0, s_lockAfter = 0;
+	static int   s_tries = 0;
+	static bool  s_wheelWasOpen = false;
+	static DWORD s_wheelSel = 0, s_pendWeapon = 0, s_pendTime = 0;
+	static DWORD s_lastSelect = 0, s_pinWeapon = 0, s_pinUntil = 0, s_lastPinTry = 0;
+	static int   s_pinTries = 0;
+	static DWORD s_slotW[4] = { 0, 0, 0, 0 }, s_slotSince[4] = { 0, 0, 0, 0 };
+	static DWORD s_goneW[4] = { 0, 0, 0, 0 }, s_goneAt[4] = { 0, 0, 0, 0 }, s_goneDur[4] = { 0, 0, 0, 0 };
+	static uint32_t cWheel = 0, cHolster = 0, cNext = 0, cPrev = 0, cHorseAim = 0, cHorseAttack = 0, wUnarmed = 0;
+	static bool init = false;
+
+	Ped ped = PLAYER::PLAYER_PED_ID();
+	bool pedOk = ENTITY::DOES_ENTITY_EXIST(ped) != 0;
+
+	if (!g_noForcedHolstering)
+	{
+		if (s_applied && pedOk)
+		{
+			invoke<Void>(0xBE711B14A159E84F, ped, TRUE);
+			invoke<Void>(0xB832F1A686B9B810, ped, TRUE, 0);
+			PED::SET_PED_CONFIG_FLAG(ped, 141, FALSE);
+		}
+		s_applied = false; s_heldWeapon = 0; s_tries = 0; s_pendWeapon = 0; s_wheelWasOpen = false;
+		return;
+	}
+
+	if (!init)
+	{
+		cWheel = NFH_Joaat("INPUT_OPEN_WHEEL_MENU");
+		cHolster = NFH_Joaat("INPUT_TOGGLE_HOLSTER");
+		cNext = NFH_Joaat("INPUT_SELECT_NEXT_WEAPON");
+		cPrev = NFH_Joaat("INPUT_SELECT_PREV_WEAPON");
+		cHorseAim = NFH_Joaat("INPUT_HORSE_AIM");
+		cHorseAttack = NFH_Joaat("INPUT_HORSE_ATTACK");
+		wUnarmed = NFH_Joaat("WEAPON_UNARMED");
+		init = true;
+	}
+
+	if (!pedOk || ENTITY::IS_ENTITY_DEAD(ped))
+	{
+		s_heldWeapon = 0; s_tries = 0; s_pendWeapon = 0;
+		return;
+	}
+
+	s_applied = true;
+	invoke<Void>(0xBE711B14A159E84F, ped, FALSE);
+	invoke<Void>(0xB832F1A686B9B810, ped, FALSE, 0);
+
+	DWORD now = (DWORD)GAMEPLAY::GET_GAME_TIMER();
+	if (now - s_lastCfg >= 500)
+	{
+		s_lastCfg = now;
+		PED::SET_PED_CONFIG_FLAG(ped, 141, TRUE);
+	}
+
+	bool mounted = PED::IS_PED_ON_MOUNT(ped) != 0;
+	if (!mounted) s_mountedSince = 0;
+	else if (!s_mountedSince) s_mountedSince = now;
+
+	bool wheelOpen = CONTROLS::IS_CONTROL_PRESSED(0, cWheel) || GRAPHICS::ANIMPOSTFX_IS_RUNNING((char*)"WheelHUDIn");
+	bool holsterInput = CONTROLS::IS_CONTROL_PRESSED(0, cHolster) || CONTROLS::IS_CONTROL_JUST_PRESSED(0, cHolster) ||
+		CONTROLS::IS_CONTROL_JUST_RELEASED(0, cHolster);
+	bool intent = wheelOpen || holsterInput ||
+		CONTROLS::IS_CONTROL_JUST_PRESSED(0, cWheel) || CONTROLS::IS_CONTROL_JUST_RELEASED(0, cWheel) ||
+		CONTROLS::IS_CONTROL_JUST_PRESSED(0, cNext) || CONTROLS::IS_CONTROL_JUST_PRESSED(0, cPrev) ||
+		CONTROLS::IS_CONTROL_PRESSED(0, cHorseAim) || CONTROLS::IS_CONTROL_PRESSED(0, cHorseAttack);
+	if (intent)
+	{
+		s_lastIntent = now;
+		s_lockAfter = now + 5000;
+	}
+	if (wheelOpen || CONTROLS::IS_CONTROL_JUST_RELEASED(0, cWheel) ||
+		CONTROLS::IS_CONTROL_JUST_PRESSED(0, cNext) || CONTROLS::IS_CONTROL_JUST_PRESSED(0, cPrev))
+		s_lastSelect = now;
+
+	Hash cur = 0;
+	WEAPON::GET_CURRENT_PED_WEAPON(ped, &cur, FALSE, 0, FALSE);
+
+	if (wheelOpen)
+	{
+		DWORD sel = (DWORD)invoke<Any>(0x9C409BBC492CB5B1);
+		if (sel) s_wheelSel = sel;
+		s_wheelWasOpen = true;
+	}
+	else if (s_wheelWasOpen)
+	{
+		s_wheelWasOpen = false;
+		if (s_wheelSel && s_wheelSel != wUnarmed && (Hash)s_wheelSel != cur)
+		{
+			DWORD back[4]; NFH_ReadBack(ped, back, wUnarmed);
+			if (!NFH_InList(back, 4, s_wheelSel)) { s_pendWeapon = s_wheelSel; s_pendTime = now; }
+		}
+		s_wheelSel = 0;
+	}
+
+	if (s_pendWeapon)
+	{
+		if (now - s_pendTime > 3500 || (DWORD)cur == s_pendWeapon) s_pendWeapon = 0;
+		else if (now - s_pendTime >= 250)
+		{
+			DWORD back[4]; NFH_ReadBack(ped, back, wUnarmed);
+			if (NFH_InList(back, 4, s_pendWeapon))
+			{
+				WEAPON::SET_CURRENT_PED_WEAPON(ped, s_pendWeapon, TRUE, 0, FALSE, FALSE);
+				s_pendWeapon = 0;
+			}
+		}
+	}
+
+	if (mounted)
+	{
+		DWORD bk[4]; NFH_ReadBack(ped, bk, wUnarmed);
+		for (int k = 0; k < 4; k++)
+		{
+			if (bk[k] == s_slotW[k]) continue;
+			if (s_slotW[k])
+			{
+				s_goneW[k] = s_slotW[k];
+				s_goneAt[k] = now;
+				s_goneDur[k] = s_slotSince[k] ? now - s_slotSince[k] : 0;
+			}
+			s_slotW[k] = bk[k];
+			s_slotSince[k] = bk[k] ? now : 0;
+		}
+
+		if (wheelOpen || holsterInput) s_pinWeapon = 0;
+
+		if (cur != 0 && cur != (Hash)wUnarmed && (DWORD)cur != s_pinWeapon && now - s_lastSelect < 4000 && NFH_IsLongarm((DWORD)cur))
+		{
+			for (int k = 0; k < 4; k++)
+			{
+				if ((DWORD)cur != s_goneW[k] || now - s_goneAt[k] > 1500 || s_goneDur[k] < 2000) continue;
+				WEAPON::SET_CURRENT_PED_WEAPON(ped, cur, TRUE, 0, FALSE, FALSE);
+				s_pinWeapon = (DWORD)cur; s_pinUntil = now + 2500; s_pinTries = 0; s_goneW[k] = 0;
+				break;
+			}
+		}
+
+		if (s_pinWeapon && now < s_pinUntil && cur == (Hash)wUnarmed && s_pinTries < 4 && now - s_lastPinTry >= 150)
+		{
+			s_lastPinTry = now;
+			s_pinTries++;
+			WEAPON::SET_CURRENT_PED_WEAPON(ped, s_pinWeapon, TRUE, 0, FALSE, FALSE);
+		}
+		if (now >= s_pinUntil) s_pinWeapon = 0;
+	}
+	else
+	{
+		for (int k = 0; k < 4; k++) { s_slotW[k] = 0; s_slotSince[k] = 0; s_goneW[k] = 0; }
+		s_pinWeapon = 0;
+	}
+
+	if (NFH_IsFirearm((DWORD)cur))
+	{
+		s_heldWeapon = (DWORD)cur;
+		s_heldSeen = now;
+		s_tries = 0;
+		return;
+	}
+
+	if (s_heldWeapon != 0)
+	{
+		if (now - s_heldSeen > 2500 || (cur != 0 && cur != (Hash)wUnarmed) || now - s_lastIntent < 6000 ||
+			!mounted || now - s_mountedSince < 1500)
+		{
+			s_heldWeapon = 0; s_tries = 0;
+		}
+		else
+		{
+			if (now - s_lastTry >= 250 && s_tries < 12)
+			{
+				s_lastTry = now;
+				s_tries++;
+				WEAPON::SET_CURRENT_PED_WEAPON(ped, s_heldWeapon, TRUE, 0, FALSE, FALSE);
+			}
+			return;
+		}
+	}
+
+	if (mounted && s_pendWeapon == 0 && cur == (Hash)wUnarmed && now > s_lockAfter && !holsterInput)
+		WEAPON::SET_CURRENT_PED_WEAPON(ped, wUnarmed, TRUE, 0, FALSE, FALSE);
+}
+
+static void StableNpcCalm_Tick()
+{
+	static vector<Ped> s_npcs;
+	static DWORD s_lastScan = 0;
+
+	Ped player = PLAYER::PLAYER_PED_ID();
+	if (!ENTITY::DOES_ENTITY_EXIST(player) || g_stables.empty())
+	{
+		s_npcs.clear();
+		return;
+	}
+
+	DWORD now = GetTickCount();
+	if (now - s_lastScan >= 500)
+	{
+		s_lastScan = now;
+		s_npcs.clear();
+
+		int buf[32 + 1];
+		buf[0] = 32;
+		int count = PED::GET_PED_NEARBY_PEDS(player, buf, -1, -1);
+		for (int i = 0; i < count && i < 32; i++)
+		{
+			Ped ped = (Ped)buf[i + 1];
+			if (!ped || !ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped)) continue;
+
+			DWORD model = (DWORD)ENTITY::GET_ENTITY_MODEL(ped);
+			if (model == 0) continue;
+
+			bool isStableNpc = false;
+			for (size_t k = 0; k < g_stables.size() && !isStableNpc; k++)
+				if (g_stables[k].isNpcMode && g_stables[k].modelHash == model) isStableNpc = true;
+			if (!isStableNpc) continue;
+
+			s_npcs.push_back(ped);
+			PED::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(ped, TRUE);
+			PED::SET_PED_FLEE_ATTRIBUTES(ped, 0, FALSE);
+			PED::SET_PED_CONFIG_FLAG(ped, 113, TRUE);
+			PED::SET_PED_CONFIG_FLAG(ped, 217, TRUE);
+			PED::SET_PED_CONFIG_FLAG(ped, 296, TRUE);
+		}
+	}
+
+	for (size_t i = 0; i < s_npcs.size(); i++)
+	{
+		Ped ped = s_npcs[i];
+		if (!ENTITY::DOES_ENTITY_EXIST(ped)) continue;
+		PED::SET_PED_RESET_FLAG(ped, 49, TRUE);
+		PED::SET_PED_RESET_FLAG(ped, 53, TRUE);
+		PED::SET_PED_RESET_FLAG(ped, 185, TRUE);
+	}
+}
+
+static void SetLockdownRegions(BOOL enabled)
+{
+	static const Any kRegions[] = {
+		0x41759831, 0xD69B5B49, 0x5647E155, 0x129E1411, 0x0E95FF51,
+		0x763A8A87, 0x33D88587, 0x99B6A1E6, 0x8966022D, 0x3AC128F9,
+		0x27253ED3, 0x5046DD11, 0xD428627B, 0xFAF570C5
+	};
+	for (size_t i = 0; i < sizeof(kRegions) / sizeof(kRegions[0]); i++)
+	{
+		MAPREGION::_0xBE551C2CC421185D(kRegions[i], enabled);
+		MAPREGION::_0x5B23DFF8E0948BB2(kRegions[i], enabled);
+	}
+}
+
+namespace LAWEXT
+{
+	static void _SET_LAW_DISABLED(BOOL toggle) { invoke<Void>(0x8DE82BC774F3B862, toggle); }
+	static void SET_LAW_SENSE_RANGE_MODIFIER(Player player, float range) { invoke<Void>(0xFEC85339AACA2A35, player, range); }
+}
+
+static void BountyFreeRoam_Tick()
+{
+	static const DWORD ZERO_DEBOUNCE_MS = 1500;
+
+	static bool  s_wasActive = false;
+	static bool  s_disguised = false;
+	static bool  s_lawEnabled = false;
+	static bool  s_lawOff = false;
+	static DWORD s_wantedZeroSince = 0;
+	static DWORD s_lastRegion = 0;
+	static DWORD s_lastMask = 0;
+
+	Ped ped = PLAYER::PLAYER_PED_ID();
+	Player player = PLAYER::PLAYER_ID();
+	bool havePed = ENTITY::DOES_ENTITY_EXIST(ped) && PLAYER::IS_PLAYER_PLAYING(player);
+
+	if (g_clear_All_Bounties_and_Lockdown_Areas == 0)
+	{
+		if (s_wasActive)
+		{
+			PLAYER::SET_MAX_WANTED_LEVEL(5);
+			PLAYER::SET_WANTED_LEVEL_MULTIPLIER(1.0f);
+			PLAYER::RESET_WANTED_LEVEL_DIFFICULTY(player);
+			SetLockdownRegions(TRUE);
+			if (s_lawOff)
+			{
+				LAWEXT::_SET_LAW_DISABLED(FALSE);
+				LAWEXT::SET_LAW_SENSE_RANGE_MODIFIER(player, 1.0f);
+				s_lawOff = false;
+			}
+			s_wasActive = false;
+		}
+		s_disguised = false;
+		s_lawEnabled = false;
+		s_wantedZeroSince = 0;
+		s_lastRegion = 0;
+		s_lastMask = 0;
+		SniperHook_SetDisguised(false);
+		return;
+	}
+
+	if (!havePed) return;
+	s_wasActive = true;
+
+	DWORD now = GetTickCount();
+
+	if (!s_lawEnabled && PED::IS_PED_SHOOTING(ped) != 0)
+	{
+		PLAYER::SET_MAX_WANTED_LEVEL(5);
+		PLAYER::SET_WANTED_LEVEL_MULTIPLIER(1.0f);
+		PLAYER::RESET_WANTED_LEVEL_DIFFICULTY(player);
+		SetLockdownRegions(TRUE);
+		if (s_lawOff)
+		{
+			LAWEXT::_SET_LAW_DISABLED(FALSE);
+			LAWEXT::SET_LAW_SENSE_RANGE_MODIFIER(player, 1.0f);
+			s_lawOff = false;
+		}
+		s_lawEnabled = true;
+		s_wantedZeroSince = 0;
+	}
+
+	if (s_lawEnabled)
+	{
+		if (PLAYER::GET_PLAYER_WANTED_LEVEL(player) == 0)
+		{
+			if (!s_wantedZeroSince) s_wantedZeroSince = now;
+			else if (now - s_wantedZeroSince >= ZERO_DEBOUNCE_MS)
+			{
+				s_lawEnabled = false;
+				s_wantedZeroSince = 0;
+			}
+		}
+		else s_wantedZeroSince = 0;
+	}
+	else
+	{
+		if (!s_lawOff)
+		{
+			LAWEXT::_SET_LAW_DISABLED(TRUE);
+			LAWEXT::SET_LAW_SENSE_RANGE_MODIFIER(player, 0.0f);
+			s_lawOff = true;
+		}
+
+		PLAYER::SET_MAX_WANTED_LEVEL(0);
+		PLAYER::SET_WANTED_LEVEL_MULTIPLIER(0.0f);
+		PLAYER::RESET_WANTED_LEVEL_DIFFICULTY(player);
+		if (PLAYER::GET_PLAYER_WANTED_LEVEL(player) != 0)
+			PLAYER::SET_PLAYER_WANTED_LEVEL(player, 0, FALSE);
+		PLAYER::CLEAR_PLAYER_WANTED_LEVEL(player);
+		PURSUIT::SET_PLAYER_WANTED_INTENSITY(player, 0);
+
+		if (now - s_lastRegion >= 100)
+		{
+			s_lastRegion = now;
+			SetLockdownRegions(FALSE);
+		}
+	}
+
+	if (now - s_lastMask >= 100)
+	{
+		s_lastMask = now;
+		s_disguised = IsFaceCovered(ped);
+	}
+
+	SniperHook_SetDisguised(s_disguised);
 }
 
 struct scrVector {
@@ -4199,16 +4614,51 @@ static string TrimNickname(const string &s)
 	size_t e = s.find_last_not_of(" \t\r\n");
 	return s.substr(b, e - b + 1);
 }
-static int FindSlotForPed(Ped horse)
+static Ped g_saddleHorse = 0;
+static vector<Ped> g_ownedHorsePeds;
+static void NoteOwnedHorse(Ped ped)
 {
-	if (horse == 0) return -1;
+	if (ped == 0) return;
+	for (size_t i = 0; i < g_ownedHorsePeds.size(); i++)
+		if (g_ownedHorsePeds[i] == ped) return;
+	if (ENTITY::DOES_ENTITY_EXIST(ped)) g_ownedHorsePeds.push_back(ped);
+}
+static bool IsOwnedByPlayer(Ped horse)
+{
+	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
+	if (g_saddleHorse != 0 && horse == g_saddleHorse) return true;
+	Ped playerPed = PLAYER::PLAYER_PED_ID();
+	if (ENTITY::DOES_ENTITY_EXIST(playerPed) && PED::GET_MOUNT(playerPed) == horse) return true;
+	for (size_t i = 0; i < g_ownedHorsePeds.size();)
+	{
+		if (!ENTITY::DOES_ENTITY_EXIST(g_ownedHorsePeds[i]) || ENTITY::IS_ENTITY_DEAD(g_ownedHorsePeds[i]))
+		{
+			g_ownedHorsePeds.erase(g_ownedHorsePeds.begin() + i);
+			continue;
+		}
+		if (g_ownedHorsePeds[i] == horse) return true;
+		++i;
+	}
+	return false;
+}
+static bool SlotNicknameMatches(int slot, const ApocalypseHorseEntry &entry)
+{
+	string name = TrimNickname(ReadName(slot));
+	if (name.empty()) return false;
+	for (size_t j = 0; j < entry.requiredNames.size(); j++)
+		if (SameName(name, TrimNickname(entry.requiredNames[j]))) return true;
+	return false;
+}
+static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse)
+{
+	if (!entry.HasRequiredNames()) return true;
 	for (int i = 0; i < kSlots; i++)
 	{
 		SlotInfo s = ReadSlot(i);
-		if (s.ok && s.state != 0 && SlotPed(i) == horse) return i;
+		if (s.ok && s.state != 0 && SlotPed(i) == horse) return SlotNicknameMatches(i, entry);
 	}
+	if (!IsOwnedByPlayer(horse)) return false;
 	DWORD m = ENTITY::GET_ENTITY_MODEL(horse);
-	int matches[kSlots]; int nm = 0;
 	for (int i = 0; i < kSlots; i++)
 	{
 		SlotInfo s = ReadSlot(i);
@@ -4219,26 +4669,9 @@ static int FindSlotForPed(Ped horse)
 			int d = DonorOfPair(s.breed, s.model);
 			if (d >= 0 && g_map[d].valid && g_map[d].realModel == m) match = true;
 		}
-		if (match && nm < kSlots) matches[nm++] = i;
+		if (!match) continue;
+		if (SlotNicknameMatches(i, entry)) return true;
 	}
-	if (nm == 0) return -1;
-	if (nm > 1)
-	{
-		Ped player = PLAYER::PLAYER_PED_ID();
-		if (ENTITY::DOES_ENTITY_EXIST(player) && PED::GET_MOUNT(player) == horse)
-			for (int k = 0; k < nm; k++) if (matches[k] == 0) return 0;
-	}
-	return matches[0];
-}
-static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse)
-{
-	if (!entry.HasRequiredNames()) return true;
-	int slot = FindSlotForPed(horse);
-	if (slot < 0) return false;
-	string name = TrimNickname(ReadName(slot));
-	if (name.empty()) return false;
-	for (size_t j = 0; j < entry.requiredNames.size(); j++)
-		if (SameName(name, TrimNickname(entry.requiredNames[j]))) return true;
 	return false;
 }
 static void DiscoverEntField(const int *validPeds, int nValid)
@@ -4544,11 +4977,15 @@ static const CoatTag kCoat_arabian_white_Vanilla[] = {
     { scale, 0.91875000f },
 	{ 0x3E83CEA8, 0x748FF64F, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 18, 1, 5 },
 	{ 0x4A4A3A1A, 0xD24DD595, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 18, 1, 6 },
+	{ 0x434D6D13, 0x0B940125, 0xE205E86E, 0x74C75769, 0xA4041CEF, 0, 0, 0 },
+	{ 0xBC8A646E, 0x6ED7F8B9, 0xE205E86E, 0x74C75769, 0xA4041CEF, 0, 0, 0 },
 };
 static const CoatTag kCoat_arabian_white_Modded[] = {
     { scale, 0.94666666f },
-	{ 0x3E83CEA8, 0x748FF64F, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 18, 1, 5 },
-	{ 0x4A4A3A1A, 0xD24DD595, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 18, 1, 6 },
+	{ 0x3E83CEA8, 0x06D1BFB5, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 99, 195, 99 },
+	{ 0x4A4A3A1A, 0x1597BB51, 0xF50673B6, 0xB36C0BE0, 0xA4041CEF, 99, 195, 99 },
+	{ 0x434D6D13, 0x3474D1F0, 0xE205E86E, 0x74C75769, 0xA4041CEF, 99, 99, 18 },
+	{ 0x287A3C54, 0x3474D1F0, 0xE205E86E, 0x74C75769, 0xA4041CEF, 99, 99, 18 },
 };
 static const CoatTag kCoat_kentuckysaddle_black_Vanilla[] = {
 	{ 0x3E83CEA8, 0x9ED04A50, 0xA377AC88, 0x36DFD0D7, 0xA4041CEF, 138, 0, 197 },
@@ -4627,6 +5064,7 @@ static vector<CoatState> g_coatStates;
 struct FlamingHoovesState { Ped ped; DWORD model; };
 static vector<FlamingHoovesState> g_flamingHoovesStates;
 
+static int CollectHorseCandidates(Ped candidates[64]);
 static bool IsWarApocalypseHorse(Ped ped, DWORD model)
 {
     if (ped == 0 || !ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped))
@@ -4635,7 +5073,7 @@ static bool IsWarApocalypseHorse(Ped ped, DWORD model)
     for (size_t i = 0; i < g_apocalypseHorses.size(); ++i)
     {
         const ApocalypseHorseEntry &entry = g_apocalypseHorses[i];
-        if (entry.name == "War" && ApocalypseEntryMatchesHorse(entry, ped, model))
+        if (entry.name == "War" && ApocalypseEntryMatchesContext(entry, ped, model))
             return true;
     }
     return false;
@@ -4669,27 +5107,8 @@ static void UpdateApocalypseFlamingHooves()
         ++i;
     }
 
-    // Include the active mount explicitly; stable/camera scenes can omit it from GET_PED_NEARBY_PEDS.
-    Ped candidates[33];
-    int candidateCount = 0;
-    Ped playerPed = PLAYER::PLAYER_PED_ID();
-    if (!ENTITY::DOES_ENTITY_EXIST(playerPed)) return;
-
-    Ped mount = PED::GET_MOUNT(playerPed);
-    if (mount && ENTITY::DOES_ENTITY_EXIST(mount))
-        candidates[candidateCount++] = mount;
-
-    int buf[32 + 1]; buf[0] = 32;
-    int count = PED::GET_PED_NEARBY_PEDS(playerPed, buf, -1, -1);
-    for (int i = 0; i < count && i < 32 && candidateCount < 33; ++i)
-    {
-        Ped nearby = (Ped)buf[i + 1];
-        if (!nearby || !ENTITY::DOES_ENTITY_EXIST(nearby)) continue;
-        bool duplicate = false;
-        for (int j = 0; j < candidateCount; ++j)
-            if (candidates[j] == nearby) { duplicate = true; break; }
-        if (!duplicate) candidates[candidateCount++] = nearby;
-    }
+    Ped candidates[64];
+    int candidateCount = CollectHorseCandidates(candidates);
 
     for (int i = 0; i < candidateCount; ++i)
     {
@@ -4754,12 +5173,130 @@ static void ApplyCoatTags(Ped ped, const CoatTag *tags, int n,
     invoke<Void>(0xCC8CA3E88256E58F, ped, false, true, true, false, false);
 }
 
+static bool CouldBeOwnedSlot(Ped ped, const SlotInfo *snap)
+{
+	uint32_t m = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
+	for (int s = 0; s < kSlots; s++)
+	{
+		if (!snap[s].ok || snap[s].state == 0) continue;
+		if (snap[s].model == m) return true;
+		int d = DonorOfPair(snap[s].breed, snap[s].model);
+		if (d >= 0 && g_map[d].valid && g_map[d].realModel == m) return true;
+	}
+	return false;
+}
+static int CollectHorseCandidates(Ped candidates[64])
+{
+	static DWORD lastCollect = 0;
+	static Ped cachedCandidates[64];
+	static int cachedCount = 0;
+	DWORD collectNow = GetTickCount();
+	if (collectNow == lastCollect)
+	{
+		for (int i = 0; i < cachedCount; i++) candidates[i] = cachedCandidates[i];
+		return cachedCount;
+	}
+	lastCollect = collectNow;
+
+	int candidateCount = 0;
+	Ped playerPed = PLAYER::PLAYER_PED_ID();
+	if (!ENTITY::DOES_ENTITY_EXIST(playerPed)) return 0;
+
+	{
+		Ped saddle = invoke<Ped>(0xB48050D326E9A2F3ull, PLAYER::PLAYER_ID());
+		g_saddleHorse = (saddle != 0 && ENTITY::DOES_ENTITY_EXIST(saddle) && !ENTITY::IS_ENTITY_DEAD(saddle)) ? saddle : 0;
+		if (g_saddleHorse != 0) NoteOwnedHorse(g_saddleHorse);
+	}
+
+	int discovery[32]; int discoveryCount = 0;
+
+	SlotInfo snap[kSlots];
+	for (int s = 0; s < kSlots; s++) snap[s] = ReadSlot(s);
+
+	Ped mount = PED::GET_MOUNT(playerPed);
+	if (mount != 0 && ENTITY::DOES_ENTITY_EXIST(mount))
+	{
+		candidates[candidateCount++] = mount;
+		NoteOwnedHorse(mount);
+		if (discoveryCount < 32 && CouldBeOwnedSlot(mount, snap)) discovery[discoveryCount++] = (int)mount;
+	}
+
+	if (g_saddleHorse != 0)
+	{
+		bool duplicate = false;
+		for (int j = 0; j < candidateCount; j++)
+			if (candidates[j] == g_saddleHorse) { duplicate = true; break; }
+		if (!duplicate) candidates[candidateCount++] = g_saddleHorse;
+		if (discoveryCount < 32 && CouldBeOwnedSlot(g_saddleHorse, snap)) discovery[discoveryCount++] = (int)g_saddleHorse;
+	}
+
+	Ped nearbyList[64]; int nearbyCount = 0;
+	{
+		int buf[64 + 1]; buf[0] = 64;
+		int count = PED::GET_PED_NEARBY_PEDS(playerPed, buf, -1, -1);
+		if (count > 64) count = 64;
+		for (int i = 0; i < count && nearbyCount < 64; i++)
+		{
+			Ped p = (Ped)buf[i + 1];
+			if (p != 0 && ENTITY::DOES_ENTITY_EXIST(p) && !ENTITY::IS_ENTITY_DEAD(p)) nearbyList[nearbyCount++] = p;
+		}
+	}
+
+	int world[128];
+	int nw = SafeWorldGetAllPeds(world, 128);
+
+	auto addOne = [&](Ped p) -> bool
+	{
+		for (int j = 0; j < candidateCount; j++)
+			if (candidates[j] == p) return false;
+		if (candidateCount >= 64) return false;
+		candidates[candidateCount++] = p;
+		return true;
+	};
+	auto isRelevantModel = [&](Ped p) -> bool
+	{
+		uint32_t m = (uint32_t)ENTITY::GET_ENTITY_MODEL(p);
+		for (size_t e = 0; e < g_apocalypseHorses.size(); e++)
+			if (g_apocalypseHorses[e].MatchesModel(m)) return true;
+		for (int s = 0; s < kSlots; s++)
+			if (snap[s].ok && snap[s].state != 0 && snap[s].model == m) return true;
+		return CouldBeOwnedSlot(p, snap);
+	};
+
+	for (int i = 0; i < nearbyCount; i++)
+	{
+		bool rel = isRelevantModel(nearbyList[i]);
+		if (rel && discoveryCount < 32) discovery[discoveryCount++] = (int)nearbyList[i];
+		if (rel) addOne(nearbyList[i]);
+	}
+	for (int i = 0; i < nw; i++)
+	{
+		Ped p = (Ped)world[i];
+		if (p == 0 || !ENTITY::DOES_ENTITY_EXIST(p) || ENTITY::IS_ENTITY_DEAD(p)) continue;
+		bool rel = isRelevantModel(p);
+		if (rel && discoveryCount < 32) discovery[discoveryCount++] = (int)p;
+		if (rel) addOne(p);
+	}
+	for (int i = 0; i < nearbyCount; i++) addOne(nearbyList[i]);
+	for (int i = 0; i < nw; i++)
+	{
+		Ped p = (Ped)world[i];
+		if (p == 0 || !ENTITY::DOES_ENTITY_EXIST(p) || ENTITY::IS_ENTITY_DEAD(p)) continue;
+		addOne(p);
+	}
+
+	if (discoveryCount > 0) DiscoverEntField(discovery, discoveryCount);
+	cachedCount = candidateCount;
+	for (int i = 0; i < candidateCount; i++) cachedCandidates[i] = candidates[i];
+	return candidateCount;
+}
+
 static void ApplyApocalypseVisuals()
 {
-	static DWORD last = 0;
+	static DWORD lastFrame = 0;
 	DWORD now = GetTickCount();
-	if (now - last < 500) return;
-	last = now;
+	if (now == lastFrame) return;
+	lastFrame = now;
 
     // Enable the game's native flaming-hooves effect on eligible War horses.
     UpdateApocalypseFlamingHooves();
@@ -4771,27 +5308,8 @@ static void ApplyApocalypseVisuals()
 	}
 
 	// Include the player's current mount explicitly. Some stable/shop scenes do not consistently return the mount in GET_PED_NEARBY_PEDS.
-	Ped candidates[33];
-	int candidateCount = 0;
-	Ped playerPed = PLAYER::PLAYER_PED_ID();
-	if (!ENTITY::DOES_ENTITY_EXIST(playerPed)) return;
-	{
-		Ped mount = PED::GET_MOUNT(playerPed);
-		if (mount != 0 && ENTITY::DOES_ENTITY_EXIST(mount))
-			candidates[candidateCount++] = mount;
-	}
-
-	int buf[32 + 1]; buf[0] = 32;
-	int count = PED::GET_PED_NEARBY_PEDS(playerPed, buf, -1, -1);
-	for (int i = 0; i < count && i < 32 && candidateCount < 33; i++)
-	{
-		Ped nearby = (Ped)buf[i + 1];
-		if (nearby == 0 || !ENTITY::DOES_ENTITY_EXIST(nearby)) continue;
-		bool duplicate = false;
-		for (int j = 0; j < candidateCount; j++)
-			if (candidates[j] == nearby) { duplicate = true; break; }
-		if (!duplicate) candidates[candidateCount++] = nearby;
-	}
+	Ped candidates[64];
+	int candidateCount = CollectHorseCandidates(candidates);
 
 	for (int i = 0; i < candidateCount; i++)
 	{
@@ -4810,7 +5328,7 @@ static void ApplyApocalypseVisuals()
 				const ApocalypseHorseEntry &entry = g_apocalypseHorses[e];
 				const CoatSet *cs = FindCoatSet(model, entry.name.c_str());
 				if (!cs) continue;
-				if (ApocalypseEntryMatchesHorse(entry, ped, model)) want = true;
+				if (ApocalypseEntryMatchesContext(entry, ped, model)) want = true;
 			}
 		}
 
@@ -4825,8 +5343,9 @@ static void ApplyApocalypseVisuals()
 		// has not changed, otherwise the cache would hide the game's reset.
 		if (idx >= 0 && g_coatStates[idx].modded == want)
 		{
-			if (!want || now - g_coatStates[idx].lastApplied < 1000)
-				continue;
+			if (!want) continue;
+			DWORD reapplyMs = StableShopUiActive() ? 150 : 1000;
+			if (now - g_coatStates[idx].lastApplied < reapplyMs) continue;
 		}
 
 		const CoatSet *cs = FindCoatSet(model);
@@ -4835,7 +5354,7 @@ static void ApplyApocalypseVisuals()
 			for (size_t e = 0; e < g_apocalypseHorses.size(); e++)
 			{
 				const CoatSet *c2 = FindCoatSet(model, g_apocalypseHorses[e].name.c_str());
-				if (c2 && ApocalypseEntryMatchesHorse(g_apocalypseHorses[e], ped, model)) { cs = c2; break; }
+				if (c2 && ApocalypseEntryMatchesContext(g_apocalypseHorses[e], ped, model)) { cs = c2; break; }
 			}
 			ApplyCoatTags(ped, cs->modded, cs->nModded, cs->vanilla, cs->nVanilla);
 		}
@@ -4854,6 +5373,25 @@ static void ApplyApocalypseVisuals()
 			CoatState st = { ped, model, want, now };
 			g_coatStates.push_back(st);
 		}
+	}
+}
+
+static void ApplyApocalypseAlwaysCleanCalm()
+{
+	Ped candidates[64];
+	int candidateCount = CollectHorseCandidates(candidates);
+
+	for (int i = 0; i < candidateCount; i++)
+	{
+		Ped horse = candidates[i];
+		if (!ENTITY::DOES_ENTITY_EXIST(horse) || ENTITY::IS_ENTITY_DEAD(horse)) continue;
+		if (!IsApocalypseHorse(horse)) continue;
+
+		invoke<Void>(0x6585D955A68452A5ull, horse);
+		PED::CLEAR_PED_WETNESS(horse);
+		invoke<Void>(0xE3144B932DFDFF65ull, horse, 0.0f, -1, TRUE, TRUE);
+		PED::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(horse, TRUE);
+		AUDIO::SET_ANIMAL_MOOD(horse, 0);
 	}
 }
 
@@ -4928,6 +5466,190 @@ static bool IsFaceCovered(Ped ped)
 		}
 	}
 	return false;
+}
+
+// ------------------------------------------------------------
+// Blanket Remover
+// ------------------------------------------------------------
+static const DWORD kBlanketBugSaddleHashes[] = {
+//	0xD225CCA0, // Boar Mother Hubbard Saddle
+//	0xB5802A5F, // Alligator Ranch Cutter Saddle
+	0xDE5A2905, // Bear Dakota Saddle
+//	0x2BEA8ED4, // Beaver Roping Saddle
+//	0xC76C46D9, // Panther Trail Saddle
+//	0x353FC03C, // Cougar McClelland Saddle
+	0x7D795D72, // Rattlesnake Vaquero Saddle
+	0xAD4A6355, // Nuevo Paraiso Saddle
+};
+
+static const DWORD kHorseBlanketHashes[] = {
+	0x003D34F3, 0x0DC87A9F, 0x0F537E4A, 0x0FAE487F, 0x127E0412,
+	0x19C5E80C, 0x20D4A0BF, 0x2286EE30, 0x269583CA, 0x2A6D33E8,
+	0x3278996D, 0x342916F3, 0x3973A986, 0x3BA0D76D, 0x41D52CD8,
+	0x4655E362, 0x4A294AF1, 0x4BF1F80F, 0x508B80B9, 0x533A022A,
+	0x53B325B7, 0x5894FB24, 0x5F0F9E4A, 0x64BE7DF8, 0x67CAAF37,
+	0x6B2084E5, 0x71DFC3EA, 0x78FB209A, 0x7951D487, 0x7D637917,
+	0x823A602A, 0x8FAD4DFE, 0x90A31F96, 0x97EBE669, 0x9AD633FC,
+	0x9DE0EA65, 0x9E468686, 0xA3D5298D, 0xAB302059, 0xAD283105,
+	0xB0F7BDA4, 0xB19B4519, 0xBBF05395, 0xC073E2CA, 0xC097E12C,
+	0xC2EF5C93, 0xC4C732B2, 0xC7688D20, 0xC8A467FD, 0xCDD2FB96,
+	0xD333865B, 0xD9E17DBB, 0xDBEF0E96, 0xE32A1050, 0xE409A807,
+	0xEBB4B70D, 0xEC040C89, 0xED0190A3, 0xEDCB3D78, 0xF506CA32,
+	0xF6484C84, 0xFA1153C6, 0xFDC3D6D3, 0xFDF4250B, 0xFFB1DE72,
+};
+
+static bool IsBlanketBugSaddle(DWORD hash)
+{
+	for (size_t i = 0; i < sizeof(kBlanketBugSaddleHashes) / sizeof(kBlanketBugSaddleHashes[0]); i++)
+		if (kBlanketBugSaddleHashes[i] == hash) return true;
+	return false;
+}
+
+static bool IsHorseBlanketComponent(DWORD hash)
+{
+	for (size_t i = 0; i < sizeof(kHorseBlanketHashes) / sizeof(kHorseBlanketHashes[0]); i++)
+		if (kHorseBlanketHashes[i] == hash) return true;
+	return false;
+}
+
+struct BlanketWatchState
+{
+	Ped ped;
+};
+static vector<BlanketWatchState> g_blanketWatch;
+
+static DWORD BlanketRemover_GetBlanketCategory(int metaPedType)
+{
+	if (metaPedType < 0) return 0;
+	return (DWORD)invoke<Any>(0x5FF9A878C3D115B8ull, 0x0FAE487F /* Trapper Blanket */, metaPedType, FALSE);
+}
+
+static bool IsBlanketComponent(DWORD component, DWORD blanketCategory, int metaPedType)
+{
+	if (IsHorseBlanketComponent(component)) return true;
+	if (blanketCategory != 0 && metaPedType >= 0)
+		return (DWORD)invoke<Any>(0x5FF9A878C3D115B8ull, component, metaPedType, FALSE) == blanketCategory;
+	return false;
+}
+
+static bool GetMountedTack(Ped horse, DWORD &blanketOut)
+{
+	blanketOut = 0;
+	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
+
+	int metaPedType = invoke<int>(0xEC9A1261BF0CE510ull, horse);
+	DWORD blanketCategory = BlanketRemover_GetBlanketCategory(metaPedType);
+
+	int numComponents = (int)PED::_0x90403E8107B60E81(horse);
+	if (numComponents <= 0 || numComponents >= 256) return false;
+
+	bool buggySaddle = false;
+	for (int i = 0; i < numComponents; i++)
+	{
+		DWORD out1 = 0, out2 = 0;
+		DWORD component = (DWORD)PED::_0x77BA37622E22023B(horse, i, FALSE, (Any*)&out1, (Any*)&out2);
+		if (component == 0) continue;
+		if (IsBlanketBugSaddle(component)) buggySaddle = true;
+		else if (IsBlanketComponent(component, blanketCategory, metaPedType)) blanketOut = component;
+	}
+	return buggySaddle;
+}
+
+static bool BlanketRemover_CleanHorse(Ped horse)
+{
+	DWORD blanket = 0;
+	if (!GetMountedTack(horse, blanket)) return false;
+
+	BlanketWatchState *state = nullptr;
+	for (size_t i = 0; i < g_blanketWatch.size(); i++)
+		if (g_blanketWatch[i].ped == horse) { state = &g_blanketWatch[i]; break; }
+	if (!state)
+	{
+		BlanketWatchState fresh = { horse };
+		g_blanketWatch.push_back(fresh);
+	}
+
+	if (blanket != 0)
+	{
+		invoke<Void>(0x0D7FFA1B2F69ED82ull, horse, blanket, 0, FALSE);
+		invoke<Void>(0xCC8CA3E88256E58Full, horse, false, true, true, false, false);
+	}
+	return true;
+}
+
+static void BlanketRemover_Tick()
+{
+	if (g_blanketRemover == 0)
+	{
+		if (!g_blanketWatch.empty()) g_blanketWatch.clear();
+		return;
+	}
+
+	Ped playerPed = PLAYER::PLAYER_PED_ID();
+	if (!ENTITY::DOES_ENTITY_EXIST(playerPed)) return;
+	Vector3 playerPos = ENTITY::GET_ENTITY_COORDS(playerPed, TRUE, TRUE);
+
+	vector<Ped> fast;
+	auto addFast = [&](Ped p)
+	{
+		if (p == 0 || !ENTITY::DOES_ENTITY_EXIST(p) || ENTITY::IS_ENTITY_DEAD(p)) return;
+		for (size_t i = 0; i < fast.size(); i++) if (fast[i] == p) return;
+		fast.push_back(p);
+	};
+	addFast(PED::GET_MOUNT(playerPed));
+	addFast(g_saddleHorse);
+	for (size_t i = 0; i < g_ownedHorsePeds.size(); i++) addFast(g_ownedHorsePeds[i]);
+	for (size_t i = 0; i < g_blanketWatch.size(); i++) addFast(g_blanketWatch[i].ped);
+	int nearFast[64 + 1]; nearFast[0] = 64;
+	int nearFastCount = PED::GET_PED_NEARBY_PEDS(playerPed, nearFast, -1, -1);
+	for (int i = 0; i < nearFastCount && i < 64; i++) addFast((Ped)nearFast[i + 1]);
+
+	for (size_t i = 0; i < fast.size(); i++)
+		BlanketRemover_CleanHorse(fast[i]);
+
+	static DWORD lastScan = 0;
+	DWORD now = GetTickCount();
+	bool inShop = StableShopUiActive();
+	if (now - lastScan < (inShop ? 150u : 300u)) return;
+	lastScan = now;
+
+	vector<Ped> candidates;
+	auto addCandidate = [&](Ped p)
+	{
+		if (p == 0 || !ENTITY::DOES_ENTITY_EXIST(p) || ENTITY::IS_ENTITY_DEAD(p)) return;
+		for (size_t i = 0; i < candidates.size(); i++)
+			if (candidates[i] == p) return;
+		if (PED::IS_PED_HUMAN(p)) return;
+		Vector3 pos = ENTITY::GET_ENTITY_COORDS(p, TRUE, TRUE);
+		float dx = pos.x - playerPos.x, dy = pos.y - playerPos.y, dz = pos.z - playerPos.z;
+		if (dx * dx + dy * dy + dz * dz > 30.0f * 30.0f) return;
+		candidates.push_back(p);
+	};
+
+	int nearBuf[64 + 1]; nearBuf[0] = 64;
+	int nearCount = PED::GET_PED_NEARBY_PEDS(playerPed, nearBuf, -1, -1);
+	for (int i = 0; i < nearCount && i < 64; i++) addCandidate((Ped)nearBuf[i + 1]);
+
+	int worldBuf[256];
+	int worldCount = SafeWorldGetAllPeds(worldBuf, 256);
+	for (int i = 0; i < worldCount; i++) addCandidate((Ped)worldBuf[i]);
+
+	for (size_t i = 0; i < candidates.size(); i++)
+		BlanketRemover_CleanHorse(candidates[i]);
+
+	for (size_t i = 0; i < g_blanketWatch.size();)
+	{
+		Ped p = g_blanketWatch[i].ped;
+		bool keep = ENTITY::DOES_ENTITY_EXIST(p) && !ENTITY::IS_ENTITY_DEAD(p);
+		if (keep)
+		{
+			Vector3 pos = ENTITY::GET_ENTITY_COORDS(p, TRUE, TRUE);
+			float dx = pos.x - playerPos.x, dy = pos.y - playerPos.y, dz = pos.z - playerPos.z;
+			keep = (dx * dx + dy * dy + dz * dz <= 40.0f * 40.0f);
+		}
+		if (keep) ++i;
+		else g_blanketWatch.erase(g_blanketWatch.begin() + i);
+	}
 }
 
 void OnlineHorses_Init(const char *iniPath)
@@ -5033,6 +5755,7 @@ void OnlineHorses_Tick(bool nearStable)
 	RetireMappedDonorPeds();
 	ApplyOnlineStats();
 	ApplyApocalypseVisuals();
+	ApplyApocalypseAlwaysCleanCalm();
 	ApplyStableHudSafe(g_donorMode && !gameCam);
 }
 
