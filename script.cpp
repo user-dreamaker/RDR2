@@ -232,6 +232,9 @@ static string LocalizedBreedName(const string &suffix);
 static string LocalizedGenderName(const string &genderKey);
 static string LocalizedMenuTitle(const char *labelKey, const char *fallback);
 static bool StableShopUiActive();
+static bool PedNicknameMatchesInShop(const ApocalypseHorseEntry &entry, Ped horse);
+static Ped g_shopShownPed = 0;
+static int g_shopShownSlot = -1;
 static bool ApocalypseEntryMatchesHorse(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
 {
 	if (!entry.MatchesModel(modelHash)) return false;
@@ -264,7 +267,8 @@ static bool ApocalypseEntryMatchesContext(const ApocalypseHorseEntry &entry, Ped
 {
 	if (ApocalypseEntryMatchesHorse(entry, horse, modelHash)) return true;
 	if (!StableShopUiActive()) return false;
-	return ApocalypseEntryMatchesModelGender(entry, horse, modelHash);
+	if (!ApocalypseEntryMatchesModelGender(entry, horse, modelHash)) return false;
+	return PedNicknameMatchesInShop(entry, horse);
 }
 
 static bool IsApocalypseHorse(Ped horse)
@@ -3273,6 +3277,63 @@ namespace LAWEXT
 {
 	static void _SET_LAW_DISABLED(BOOL toggle) { invoke<Void>(0x8DE82BC774F3B862, toggle); }
 	static void SET_LAW_SENSE_RANGE_MODIFIER(Player player, float range) { invoke<Void>(0xFEC85339AACA2A35, player, range); }
+	static Blip BLIP_ADD_FOR_ENTITY(Any style, Entity entity) { return invoke<Blip>(0x23F74C2FDA6E7C61ull, style, entity); }
+}
+
+struct LawBlipState { Ped ped; Blip blip; };
+static vector<LawBlipState> g_lawBlips;
+
+static void UpdateLawBlips(Ped playerPed, const Vector3 &playerPos)
+{
+	for (size_t i = 0; i < g_lawBlips.size();)
+	{
+		Ped p = g_lawBlips[i].ped;
+		bool keep = ENTITY::DOES_ENTITY_EXIST(p) && !ENTITY::IS_ENTITY_DEAD(p) && PED::GET_PED_TYPE(p) == 6;
+		if (keep)
+		{
+			Vector3 pos = ENTITY::GET_ENTITY_COORDS(p, TRUE, TRUE);
+			float dx = pos.x - playerPos.x, dy = pos.y - playerPos.y, dz = pos.z - playerPos.z;
+			keep = (dx * dx + dy * dy + dz * dz <= 120.0f * 120.0f);
+		}
+		if (keep) { ++i; continue; }
+		if (RADAR::DOES_BLIP_EXIST(g_lawBlips[i].blip))
+		{
+			Blip b = g_lawBlips[i].blip;
+			RADAR::REMOVE_BLIP(&b);
+		}
+		g_lawBlips.erase(g_lawBlips.begin() + i);
+	}
+
+	int nearArr[64 + 1]; nearArr[0] = 64;
+	int nearCount = PED::GET_PED_NEARBY_PEDS(playerPed, nearArr, -1, -1);
+	for (int i = 0; i < nearCount && i < 64; i++)
+	{
+		Ped p = (Ped)nearArr[i + 1];
+		if (p == 0 || !ENTITY::DOES_ENTITY_EXIST(p) || PED::GET_PED_TYPE(p) != 6) continue;
+		bool known = false;
+		for (size_t k = 0; k < g_lawBlips.size(); k++)
+			if (g_lawBlips[k].ped == p) { known = true; break; }
+		if (known) continue;
+
+		Blip b = LAWEXT::BLIP_ADD_FOR_ENTITY(0xE793A75A, p);
+		if (b != 0)
+		{
+			RADAR::SET_BLIP_SCALE(b, 0.8f);
+			LawBlipState entry = { p, b };
+			g_lawBlips.push_back(entry);
+		}
+	}
+}
+
+static void ClearLawBlips()
+{
+	for (size_t i = 0; i < g_lawBlips.size(); i++)
+		if (RADAR::DOES_BLIP_EXIST(g_lawBlips[i].blip))
+		{
+			Blip b = g_lawBlips[i].blip;
+			RADAR::REMOVE_BLIP(&b);
+		}
+	g_lawBlips.clear();
 }
 
 static void BountyFreeRoam_Tick()
@@ -3286,6 +3347,7 @@ static void BountyFreeRoam_Tick()
 	static DWORD s_wantedZeroSince = 0;
 	static DWORD s_lastRegion = 0;
 	static DWORD s_lastMask = 0;
+	static bool  s_lastMaskState = false;
 
 	Ped ped = PLAYER::PLAYER_PED_ID();
 	Player player = PLAYER::PLAYER_ID();
@@ -3307,7 +3369,9 @@ static void BountyFreeRoam_Tick()
 			}
 			s_wasActive = false;
 		}
+		ClearLawBlips();
 		s_disguised = false;
+		s_lastMaskState = false;
 		s_lawEnabled = false;
 		s_wantedZeroSince = 0;
 		s_lastRegion = 0;
@@ -3319,7 +3383,20 @@ static void BountyFreeRoam_Tick()
 	if (!havePed) return;
 	s_wasActive = true;
 
+	Vector3 lawPos = ENTITY::GET_ENTITY_COORDS(ped, TRUE, TRUE);
+	UpdateLawBlips(ped, lawPos);
+
 	DWORD now = GetTickCount();
+
+	bool maskedNow = IsFaceCovered(ped);
+	bool maskChanged = (maskedNow != s_lastMaskState);
+	s_lastMaskState = maskedNow;
+	if (maskChanged || now - s_lastMask >= 100)
+	{
+		s_lastMask = now;
+		s_disguised = maskedNow;
+	}
+	SniperHook_SetDisguised(s_disguised);
 
 	if (!s_lawEnabled && PED::IS_PED_SHOOTING(ped) != 0)
 	{
@@ -3337,9 +3414,11 @@ static void BountyFreeRoam_Tick()
 		s_wantedZeroSince = 0;
 	}
 
-	if (s_lawEnabled)
+	bool isWanted = PLAYER::GET_PLAYER_WANTED_LEVEL(player) != 0;
+
+	if (s_lawEnabled || isWanted)
 	{
-		if (PLAYER::GET_PLAYER_WANTED_LEVEL(player) == 0)
+		if (!isWanted)
 		{
 			if (!s_wantedZeroSince) s_wantedZeroSince = now;
 			else if (now - s_wantedZeroSince >= ZERO_DEBOUNCE_MS)
@@ -3348,13 +3427,23 @@ static void BountyFreeRoam_Tick()
 				s_wantedZeroSince = 0;
 			}
 		}
-		else s_wantedZeroSince = 0;
-	}
-	else
-	{
-		if (!s_lawOff)
+		else
 		{
-			LAWEXT::_SET_LAW_DISABLED(TRUE);
+			s_wantedZeroSince = 0;
+			s_lawEnabled = true;
+			if (s_lawOff)
+			{
+				LAWEXT::_SET_LAW_DISABLED(FALSE);
+				LAWEXT::SET_LAW_SENSE_RANGE_MODIFIER(player, 1.0f);
+				s_lawOff = false;
+			}
+		}
+	}
+	else if (s_disguised)
+	{
+		if (!s_lawOff || maskChanged)
+		{
+			LAWEXT::_SET_LAW_DISABLED(FALSE);
 			LAWEXT::SET_LAW_SENSE_RANGE_MODIFIER(player, 0.0f);
 			s_lawOff = true;
 		}
@@ -3367,20 +3456,31 @@ static void BountyFreeRoam_Tick()
 		PLAYER::CLEAR_PLAYER_WANTED_LEVEL(player);
 		PURSUIT::SET_PLAYER_WANTED_INTENSITY(player, 0);
 
-		if (now - s_lastRegion >= 100)
+		if (now - s_lastRegion >= 100 || maskChanged)
 		{
 			s_lastRegion = now;
 			SetLockdownRegions(FALSE);
 		}
 	}
-
-	if (now - s_lastMask >= 100)
+	else
 	{
-		s_lastMask = now;
-		s_disguised = IsFaceCovered(ped);
-	}
+		if (s_lawOff || maskChanged)
+		{
+			LAWEXT::_SET_LAW_DISABLED(FALSE);
+			LAWEXT::SET_LAW_SENSE_RANGE_MODIFIER(player, 1.0f);
+			s_lawOff = false;
+		}
 
-	SniperHook_SetDisguised(s_disguised);
+		PLAYER::SET_MAX_WANTED_LEVEL(5);
+		PLAYER::SET_WANTED_LEVEL_MULTIPLIER(1.0f);
+		PLAYER::RESET_WANTED_LEVEL_DIFFICULTY(player);
+
+		if (now - s_lastRegion >= 100 || maskChanged)
+		{
+			s_lastRegion = now;
+			SetLockdownRegions(TRUE);
+		}
+	}
 }
 
 struct scrVector {
@@ -4674,6 +4774,30 @@ static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse)
 	}
 	return false;
 }
+static bool PedNicknameMatchesInShop(const ApocalypseHorseEntry &entry, Ped horse)
+{
+	if (!entry.HasRequiredNames()) return true;
+	if (g_shopShownSlot >= 0 && horse == g_shopShownPed) return SlotNicknameMatches(g_shopShownSlot, entry);
+	for (int i = 0; i < kSlots; i++)
+	{
+		SlotInfo s = ReadSlot(i);
+		if (s.ok && s.state != 0 && SlotPed(i) == horse) return SlotNicknameMatches(i, entry);
+	}
+	DWORD m = ENTITY::GET_ENTITY_MODEL(horse);
+	for (int i = 0; i < kSlots; i++)
+	{
+		SlotInfo s = ReadSlot(i);
+		if (!s.ok || s.state == 0) continue;
+		bool match = (s.model == m);
+		if (!match)
+		{
+			int d = DonorOfPair(s.breed, s.model);
+			if (d >= 0 && g_map[d].valid && g_map[d].realModel == m) match = true;
+		}
+		if (match && SlotNicknameMatches(i, entry)) return true;
+	}
+	return false;
+}
 static void DiscoverEntField(const int *validPeds, int nValid)
 {
 	static DWORD lastTry = 0; static int tries = 0;
@@ -4793,7 +4917,7 @@ static void ApplyStableHud(bool inMenu)
 {
 	static Ped candPed = 0; static int candCount = 0; static Vector3 prevCam;
 	static bool haveOurs = false; static uint32_t oursType = 0, oursBreed = 0, oursCoat = 0;
-	if (!g_hud || !inMenu) { candPed = 0; candCount = 0; return; }
+	if (!g_hud || !inMenu) { candPed = 0; candCount = 0; g_shopShownPed = 0; g_shopShownSlot = -1; return; }
 	static DWORD last = 0;
 	DWORD now = GetTickCount();
 	if (now - last < 150) return;
@@ -4888,6 +5012,13 @@ static void ApplyStableHud(bool inMenu)
 			if (holdsOurs) HudClearOurs(cont, haveOurs);
 			return;
 		}
+	}
+
+	g_shopShownPed = 0; g_shopShownSlot = -1;
+	if (shown > 0)
+	{
+		g_shopShownPed = shown;
+		for (int sl = 0; sl < kSlots; sl++) if (SlotPed(sl) == shown) { g_shopShownSlot = sl; break; }
 	}
 
 	if (shown != candPed || camMoved > 0.15f)
