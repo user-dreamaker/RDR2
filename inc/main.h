@@ -7,8 +7,11 @@
 #pragma once
 
 #include <windows.h>
+#include <cstdint>
 
 #define IMPORT __declspec(dllimport)
+// ScriptHookRDR2 V2
+#define DLL_IMPORT IMPORT
 
 /* keyboard */
 
@@ -52,6 +55,9 @@ IMPORT int worldGetAllVehicles(int *arr, int arrSize);
 IMPORT int worldGetAllPeds(int *arr, int arrSize);
 IMPORT int worldGetAllObjects(int *arr, int arrSize);
 IMPORT int worldGetAllPickups(int *arr, int arrSize);
+// ScriptHookRDR2 V2
+IMPORT int worldGetAllBlips(int *arr, int arrSize);
+IMPORT int worldGetAllDoors(int *arr, int arrSize);
 
 /* misc */
 
@@ -71,3 +77,16 @@ enum eGameVersion : int
 };
 
 IMPORT eGameVersion getGameVersion();
+
+// ScriptHookRDR2 V2
+DLL_IMPORT uint64_t *getStaticPtr(const char *scriptName, int staticIndex);
+
+DLL_IMPORT void switchLabel(const char *oldLabel, const char *newLabel);
+
+DLL_IMPORT void *getCommandFromHash(uint64_t hash);
+
+DLL_IMPORT void addCustomLabel(const char *oldLabel, const char *newLabel);
+
+DLL_IMPORT void registerSprite(const char *name, const char *textureDict, const char *textureName);
+
+DLL_IMPORT void scriptCleanup(HMODULE module, void(*LP_SCRIPT_MAIN)());

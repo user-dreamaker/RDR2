@@ -1041,6 +1041,7 @@ namespace PED
 	static Vector3 GET_ANIM_INITIAL_OFFSET_ROTATION(char* animDict, char* animName, float x, float y, float z, float xRot, float yRot, float zRot, float p8, int p9) { return invoke<Vector3>(0x4B805E6046EE9E47, animDict, animName, x, y, z, xRot, yRot, zRot, p8, p9); }
 	static void SET_PED_RANDOM_COMPONENT_VARIATION(Ped ped, BOOL p1) { invoke<Void>(0xC8A9481A01E63C28, ped, p1); }
 	static void KNOCK_OFF_PED_PROP(Ped ped, BOOL p1, BOOL knockOff, BOOL p2, BOOL p3) { invoke<Void>(0x6FD7816A36615F48, ped, p1, knockOff, p2, p3); }
+	// ScriptHookRDR2 V2
 	static int _GET_NUM_COMPONENT_CATEGORIES_IN_PED(Ped ped) { return invoke<int>(0xA622E66EEE92A08D, ped); }
 	static Any _GET_PED_COMPONENT_CATEGORY_BY_INDEX(Ped ped, int index) { return invoke<Any>(0xCCB97B51893C662F, ped, index); }
 	static BOOL _IS_META_PED_USING_COMPONENT(Ped ped, Any componentHash) { return invoke<BOOL>(0xFB4891BD7578CDC1, ped, componentHash); }
@@ -4750,6 +4751,9 @@ namespace UI
 	static Any _0x66F35DD9D2B58579() { return invoke<Any>(0x66F35DD9D2B58579); }
 	static void _0xB981DD2DFAF9B1C9(Any p0, Any* p1, Any* p2, Any* p3, Any* p4) { invoke<Void>(0xB981DD2DFAF9B1C9, p0, p1, p2, p3, p4); }
 	static void SET_TEXT_SCALE(float unk, float scale) { invoke<Void>(0x4170B650590B3B00, unk, scale); }
+	// ScriptHookRDR2 V2
+	static void SET_TEXT_JUSTIFICATION(int justifyType) { invoke<Void>(0x1B929974, justifyType); }
+	static void SET_TEXT_FONT(int fontType) { invoke<Void>(0x3EDE2F10, fontType); }
 	static void SET_TEXT_COLOR_RGBA(Any p0, Any p1, Any p2, Any p3) { invoke<Void>(0x50A41AD966910F03, p0, p1, p2, p3); }
 	static void SET_TEXT_CENTRE(BOOL align) { invoke<Void>(0xBE5261939FBECB8C, align); }
 	static void SET_TEXT_DROPSHADOW(int distance, int r, int g, int b, int a) { invoke<Void>(0x1BE39DBAA7263CA5, distance, r, g, b, a); }
@@ -5171,6 +5175,8 @@ namespace GRAPHICS
 	static void _0x171C18E994C1A395(Any p0, Any p1, float p2, float p3, float p4) { invoke<Void>(0x171C18E994C1A395, p0, p1, p2, p3, p4); }
 	static void DELETE_CHECKPOINT(int checkpoint) { invoke<Void>(0x0DED5B0C8EBAAE12, checkpoint); }
 	static void DRAW_RECT(float x, float y, float width, float height, int r, int g, int b, int a, BOOL p8, BOOL p9) { invoke<Void>(0x405224591DF02025, x, y, width, height, r, g, b, a, p8, p9); }
+	// ScriptHookRDR2 V2
+	static void DRAW_LINE(float fromX, float fromY, float fromZ, float toX, float toY, float toZ, int r, int g, int b, int a) { invoke<Void>(0xec2ab68b, fromX, fromY, fromZ, toX, toY, toZ, r, g, b, a); }
 	static void SET_SCRIPT_GFX_DRAW_BEHIND_PAUSEMENU(BOOL p0) { invoke<Void>(0x906B86E6D7896B9E, p0); }
 	static void _SET_UI_LAYER(int layer) { invoke<Void>(0xCFCC78391C8B3814, layer); }
 	static void DRAW_SPRITE(char* textureDict, char* textureName, float screenX, float screenY, float width, float height, float heading, int red, int green, int blue, int alpha, BOOL p11) { invoke<Void>(0xC9884ECADE94CB34, textureDict, textureName, screenX, screenY, width, height, heading, red, green, blue, alpha, p11); }
