@@ -3,6 +3,7 @@
 #include "inc\natives.h"
 #include "inc\types.h"
 #include "inc\main.h"
+#include "inc.h"
 
 #include <windows.h>
 #include <vector>
