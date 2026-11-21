@@ -28,6 +28,7 @@ static void BlanketRemover_Tick();
 static bool StableShopUiActive();
 void OnlineHorses_Shutdown();
 static bool IsFaceCovered(Ped ped);
+static int SafeWorldGetAllPeds(int *arr, int n);
 
 int g_menuToggle = 113;
 int g_refreshKey = 0;
@@ -223,6 +224,28 @@ static void ClearSpawnedPeds()
 	}
 	g_spawnedPeds.clear();
 	if (mount != 0) g_spawnedPeds.push_back({ SpawnEntry(), mount, 0, 0, 0, true, true, true, 0 });
+}
+
+static bool ClearHorsesNearPoint(float x, float y, float radius)
+{
+	Ped playerPed = PLAYER::PLAYER_PED_ID();
+	Ped mount = ENTITY::DOES_ENTITY_EXIST(playerPed) ? PED::GET_MOUNT(playerPed) : 0;
+	int arr[256];
+	int count = SafeWorldGetAllPeds(arr, 256);
+	float r2 = radius * radius;
+	for (int i = 0; i < count && i < 256; i++)
+	{
+		Ped p = (Ped)arr[i];
+		if (p == 0 || !ENTITY::DOES_ENTITY_EXIST(p) || ENTITY::IS_ENTITY_DEAD(p)) continue;
+		if (p == mount || PED::IS_PED_A_PLAYER(p)) continue;
+		if (!PED::IS_PED_HUMAN(p) && !invoke<BOOL>(0x772A1969F649E902ull, ENTITY::GET_ENTITY_MODEL(p))) continue;
+		Vector3 pos = ENTITY::GET_ENTITY_COORDS(p, TRUE, TRUE);
+		float dx = pos.x - x, dy = pos.y - y;
+		if (dx * dx + dy * dy > r2) continue;
+		ENTITY::SET_ENTITY_AS_MISSION_ENTITY(p, TRUE, TRUE);
+		ENTITY::DELETE_ENTITY(&p);
+	}
+	return true;
 }
 
 static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse);
@@ -1508,7 +1531,15 @@ class MenuItemHorseSpawn : public MenuItemDefault
 
 		FadeAndSpawn([this, model, coords]()
 		{
-			Ped horse = PED::CREATE_PED(model, coords.x, coords.y, coords.z,
+			if (m_hasSpawnPos)
+				ClearHorsesNearPoint(coords.x, coords.y, 2.0f);
+
+			float spawnZ = coords.z;
+			float groundZ = 0.0f;
+			if (GAMEPLAY::GET_GROUND_Z_FOR_3D_COORD(coords.x, coords.y, coords.z + 1.0f, &groundZ, TRUE))
+				spawnZ = groundZ;
+
+			Ped horse = PED::CREATE_PED(model, coords.x, coords.y, spawnZ,
 				static_cast<float>(rand() % 360), 0, 0, 0, 0);
 
 			if (horse != 0)
