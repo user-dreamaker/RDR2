@@ -19,6 +19,7 @@ void SniperHook_Shutdown();
 
 void OnlineHorses_Init(const char *iniPath);
 void OnlineHorses_Tick(bool nearStable);
+void StoryHorseRename_Tick();
 static void BountyFreeRoam_Tick();
 static void NoForcedHolstering_Tick();
 static void StableNpcCalm_Tick();
@@ -3238,6 +3239,7 @@ void main()
 		}
 
 		BlanketRemover_Tick();
+		StoryHorseRename_Tick();
 
 		WAIT(0);
 	}
@@ -6428,3 +6430,195 @@ static bool UnlockAllOutfits()
 	ITEMS::_0x9B4E793B1CB6550A();
 	return added > 0;
 }
+
+namespace StoryHorseRename
+{
+	typedef void *(*GetScrProgramFn)(uint32_t hash);
+
+	static const uint8_t kOpLen[256] = {
+		  1,   3,   3,   4,   1,   1,   1,   1,   1,   1,   3,   1,   1,   1,   1,   1,
+		  1,   1,   1,   1,   2,   3,   1,   2,   3,   1,   1,   1,   1,   1,   1,   2,
+		  1,   4,   0,   3,   1,   3,   4,   2,   4,   2,   1,   1,   1,   1,   3,   1,
+		  1,   1,   1,   1,   1,   1,   1,   5,   1,   4,   3,   3, 255,   1,   4,   1,
+		  3,   1,   1,   1,   3,   1,   3,   1,   1,   1,   3,   2,   1,   1,   2,   1,
+		  3,   1,   1,   1,   2,   1,   1,   1,   3,   1,   1,   1,   2,   4,   2,   3,
+		  1,   1,   1,   2,   2,   1,   2,   2,   3,   1,   1,   4,   2,   2,   1,   3,
+		  3,   1,   3,   1,   1,   3,   1,   1,   3,   2,   1,   4,   1,   1,   1,   3,
+		  2,   1,   1,   1,   1,   4,   5,   3,   1,   2,   3,   3,   3,   1,   1,   1,
+		  1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,
+		  1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,
+		  1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,
+		  1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,
+		  1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,
+		  1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,
+		  1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,   1,
+	};
+
+	static const uint8_t  kOpEnter  = 0x22;
+	static const uint8_t  kOpLeave  = 0x50;
+	static const uint32_t kOrdinal  = 0x597;
+	static const uint8_t  kPatch[5] = { 0x13, 0x2F, 0x50, 0x01, 0x01 };
+
+	enum Status
+	{
+		ST_NOT_LOADED = 0, ST_PATCHED = 1, ST_ALREADY = 2,
+		ST_MISMATCH = -1, ST_FAULT = -2, ST_WRITE_FAIL = -3
+	};
+
+	static const uint8_t *ScanRegion(const uint8_t *b, const uint8_t *e, const int *pat, size_t n)
+	{
+		if (!b || e <= b || (size_t)(e - b) < n) return nullptr;
+		const uint8_t *last = e - n;
+		for (const uint8_t *p = b; p <= last; ++p)
+		{
+			if (*p != (uint8_t)pat[0]) continue;
+			size_t i = 1;
+			for (; i < n; ++i) if (pat[i] >= 0 && p[i] != (uint8_t)pat[i]) break;
+			if (i == n) return p;
+		}
+		return nullptr;
+	}
+
+	static const uint8_t *ScanImage(const int *pat, size_t n)
+	{
+		const uint8_t *base = (const uint8_t *)GetModuleHandleA(NULL);
+		if (!base) return nullptr;
+		const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+		const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+		const uint8_t *p = base, *end = base + nt->OptionalHeader.SizeOfImage;
+		const DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		while (p < end)
+		{
+			MEMORY_BASIC_INFORMATION mbi;
+			if (!VirtualQuery(p, &mbi, sizeof(mbi))) break;
+			const uint8_t *rb = (const uint8_t *)mbi.BaseAddress;
+			const uint8_t *re = rb + mbi.RegionSize;
+			if (mbi.State == MEM_COMMIT && (mbi.Protect & execMask) && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+			{
+				const uint8_t *hit = ScanRegion(rb < base ? base : rb, re > end ? end : re, pat, n);
+				if (hit) return hit;
+			}
+			if (re <= p) break;
+			p = re;
+		}
+		return nullptr;
+	}
+
+	static GetScrProgramFn ResolveGetProgram()
+	{
+		static const int pat[] = { 0xE8, -1, -1, -1, -1, 0x48, 0x63, 0x48, 0x20 };
+		const uint8_t *m = ScanImage(pat, sizeof(pat) / sizeof(pat[0]));
+		if (!m) return nullptr;
+		int32_t rel = 0;
+		memcpy(&rel, m + 1, sizeof(rel));
+		return (GetScrProgramFn)(m + 5 + rel);
+	}
+
+	static inline uint8_t *CodePtr(uint8_t **pages, uint32_t size, uint32_t pos)
+	{
+		return pos < size ? pages[pos >> 14] + (pos & 0x3FFF) : nullptr;
+	}
+	static inline uint32_t OpLength(const uint8_t *p)
+	{
+		uint8_t l = kOpLen[*p];
+		if (l == 0)   return 5u + p[4];
+		if (l == 255) return 2u + 6u * p[1];
+		return l;
+	}
+
+	static bool LocateFunctionBody(uint8_t **pages, uint32_t size, uint32_t &outStart, uint32_t &outEnd)
+	{
+		uint8_t *cur = pages[0];
+		if (!cur) return false;
+		uint32_t pos = 0, enters = 0, start = 0;
+		bool haveStart = false;
+		for (;;)
+		{
+			uint8_t op = *cur;
+			if (op == kOpEnter)
+			{
+				if (enters == kOrdinal + 1) { start = pos; haveStart = true; }
+				else enters++;
+			}
+			else if (op == kOpLeave && haveStart)
+			{
+				outStart = start; outEnd = pos;
+				return true;
+			}
+			cur = CodePtr(pages, size, pos);
+			if (!cur) return false;
+			pos += OpLength(cur);
+			if (pos >= size) return false;
+		}
+	}
+
+	static uint8_t *FindPatchSite(uint8_t **pages, uint32_t size)
+	{
+		uint32_t start = 0, end = 0;
+		if (!LocateFunctionBody(pages, size, start, end)) return nullptr;
+		if (end < start + sizeof(kPatch)) return nullptr;
+		uint8_t *leave = CodePtr(pages, size, end - 3);
+		if (!leave || leave[0] != kOpLeave || leave[1] != kPatch[3] || leave[2] != kPatch[4])
+			return nullptr;
+		if (((start & 0x3FFF) + sizeof(kPatch)) > 0x4000) return nullptr;
+		return CodePtr(pages, size, start);
+	}
+
+#ifdef _MSC_VER
+	#define SHR_TRY    __try
+	#define SHR_CATCH  __except (EXCEPTION_EXECUTE_HANDLER)
+#else
+	#define SHR_TRY
+	#define SHR_CATCH  if (false)
+#endif
+
+	static int TryPatch(GetScrProgramFn getProgram, uint32_t hash)
+	{
+		SHR_TRY
+		{
+			uint8_t *prog = (uint8_t *)getProgram(hash);
+			if (!prog) return ST_NOT_LOADED;
+			uint8_t **pages = *(uint8_t ***)(prog + 0x10);
+			uint32_t size   = *(uint32_t *)(prog + 0x1C);
+			if (!pages || size < 0x1000 || size > 0x4000000) return ST_MISMATCH;
+
+			uint8_t *dst = FindPatchSite(pages, size);
+			if (!dst) return ST_MISMATCH;
+			if (memcmp(dst, kPatch, sizeof(kPatch)) == 0) return ST_ALREADY;
+
+			DWORD oldProt = 0, tmp = 0;
+			if (!VirtualProtect(dst, sizeof(kPatch), PAGE_EXECUTE_READWRITE, &oldProt)) return ST_WRITE_FAIL;
+			memcpy(dst, kPatch, sizeof(kPatch));
+			VirtualProtect(dst, sizeof(kPatch), oldProt, &tmp);
+			return ST_PATCHED;
+		}
+		SHR_CATCH
+		{
+			return ST_FAULT;
+		}
+	}
+
+	void Tick()
+	{
+		static DWORD last = 0;
+		DWORD now = GetTickCount();
+		if (now - last < 250) return;
+		last = now;
+
+		static bool resolved = false;
+		static GetScrProgramFn fn = nullptr;
+		if (!resolved)
+		{
+			resolved = true;
+			fn = ResolveGetProgram();
+		}
+		if (!fn) return;
+
+		static const uint32_t hash = Joaat("shop_horse_shop_sp");
+		TryPatch(fn, hash);
+	}
+}
+
+void StoryHorseRename_Tick() { StoryHorseRename::Tick(); }
