@@ -17,7 +17,7 @@ static bool SniperHook_Initialize();
 static void SniperHook_SetDisguised(bool disguised);
 void SniperHook_Shutdown();
 
-void OnlineHorses_Init(const char *iniPath);
+void OnlineHorses_Init();
 void OnlineHorses_Tick(bool nearStable);
 void StoryHorseRename_Tick();
 static void BountyFreeRoam_Tick();
@@ -343,7 +343,7 @@ static bool ClearHorsesNearPoint(float x, float y, float radius)
 }
 
 static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse);
-static DWORD ResolveApocalypseHorseModel(Ped horse, DWORD visibleModel);
+static DWORD ResolveApocalypseHorseModel(DWORD visibleModel);
 static string TrimText(const char *text);
 static string LocalizedBreedName(const string &suffix);
 static string LocalizedGenderName(const string &genderKey);
@@ -392,7 +392,7 @@ static bool IsApocalypseHorse(Ped horse)
 	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
 
 	DWORD visibleModel = ENTITY::GET_ENTITY_MODEL(horse);
-	DWORD modelHash = ResolveApocalypseHorseModel(horse, visibleModel);
+	DWORD modelHash = ResolveApocalypseHorseModel(visibleModel);
 
 	for (size_t i = 0; i < g_apocalypseHorses.size(); i++)
 		if (ApocalypseEntryMatchesContext(g_apocalypseHorses[i], horse, modelHash)) return true;
@@ -867,6 +867,68 @@ static void LoadKeysFromIni(const string &iniPath)
 	}
 }
 
+struct BreedStat { string breed; int v[4]; };
+static vector<BreedStat> g_customStats;
+static bool g_horseNamesDirty = true;
+
+static void LoadHorseCustomStats(const string &iniPath)
+{
+	g_customStats.clear();
+	g_horseNamesDirty = true;
+	static char buf[16384];
+	buf[0] = 0;
+	DWORD len = GetPrivateProfileSectionA("HorseCustomStats", buf, sizeof(buf), iniPath.c_str());
+	for (const char *p = buf; len && *p; p += strlen(p) + 1)
+	{
+		string line(p);
+		size_t eq = line.find('=');
+		if (eq == string::npos) continue;
+		string key = Trim(line.substr(0, eq));
+		if (key.size() <= 6 || _strnicmp(key.c_str(), "BREED_", 6) != 0) continue;
+
+		BreedStat bs;
+		bs.breed = key.substr(6);
+		for (size_t i = 0; i < bs.breed.size(); i++) bs.breed[i] = (char)toupper((unsigned char)bs.breed[i]);
+
+		string val = Trim(line.substr(eq + 1));
+		const char *q = val.c_str();
+		int n = 0;
+		while (n < 4)
+		{
+			char *end = nullptr;
+			long x = strtol(q, &end, 10);
+			if (end == q) break;
+			bs.v[n++] = x < 1 ? 1 : (x > 10 ? 10 : (int)x);
+			q = end;
+			while (*q == ' ' || *q == '\t') q++;
+			if (*q != '|') break;
+			q++;
+		}
+		if (n == 4) g_customStats.push_back(bs);
+	}
+}
+
+static const BreedStat *BestBreedStat(string n, const BreedStat *best)
+{
+	if (n.compare(0, 10, "A_C_HORSE_") == 0) n = n.substr(10);
+	for (size_t i = 0; i < g_customStats.size(); i++)
+	{
+		const BreedStat &b = g_customStats[i];
+		if (n.compare(0, b.breed.size(), b.breed) == 0 && (n.size() == b.breed.size() || n[b.breed.size()] == '_') &&
+			(!best || b.breed.size() > best->breed.size())) best = &b;
+	}
+	return best;
+}
+
+static bool CustomStatsFor(const string &modelName, const string &alt, int out[4])
+{
+	const BreedStat *best = BestBreedStat(modelName, nullptr);
+	if (!alt.empty()) best = BestBreedStat(alt, best);
+	if (!best) return false;
+	for (int k = 0; k < 4; k++) out[k] = best->v[k];
+	return true;
+}
+
 static void LoadConfig()
 {
 	string iniPath = GetIniPath();
@@ -875,6 +937,7 @@ static void LoadConfig()
 		return;
 
 	LoadKeysFromIni(iniPath);
+	LoadHorseCustomStats(iniPath);
 
 	g_bankModelHash = 0;
 	g_bankPhrases.clear();
@@ -2100,7 +2163,7 @@ void main()
 {
 	LoadConfig();
 
-	OnlineHorses_Init(GetIniPath().c_str());
+	OnlineHorses_Init();
 
 	bool prevFreeRoam = (g_clear_All_Bounties_and_Lockdown_Areas != 0);
 	if (prevFreeRoam)
@@ -3251,255 +3314,317 @@ void ScriptMain()
 	main();
 }
 
-static uint32_t NFH_Joaat(const char *s)
+struct NfhState
 {
-	uint32_t h = 0;
-	for (; *s; ++s)
-	{
-		char c = *s; if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-		h += (uint8_t)c; h += h << 10; h ^= h >> 6;
-	}
-	h += h << 3; h ^= h >> 11; h += h << 15;
-	return h;
+	bool wasMounted = false, rearmA = false, rearmB = false;
+	bool heldActive = false, heldDone = false, wheelSession = false, wheelConfirmed = false;
+	int lastPed = 0, lockUntil = 0, nextCheck = 0, blockUntil = 0, wheelOpenTime = 0, heldSince = 0;
+	int lastSeenX = 0, firstSeenX = 0, lastSeenY = 0, firstSeenY = 0;
+	DWORD heldWeapon = 0, wheelSel = 0, sideA = 0, sideB = 0, candX = 0, candY = 0, prevCur = 0xFFFFFFFF;
+	DWORD slotPrev[4] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+	int slotSince[4] = { 0, 0, 0, 0 };
+};
+
+static void NFH_ClearHeld(NfhState &s)
+{
+	s.heldWeapon = 0; s.heldSince = 0; s.heldActive = false; s.heldDone = false;
 }
 
-static bool NFH_IsFirearm(DWORD w)
+static void NFH_ResetCommon(NfhState &s)
 {
-	static const char *kNames[] = {
-		"WEAPON_RIFLE_BOLTACTION", "WEAPON_RIFLE_SPRINGFIELD", "WEAPON_RIFLE_ELEPHANT", "WEAPON_RIFLE_VARMINT",
-		"WEAPON_REPEATER_CARBINE", "WEAPON_REPEATER_WINCHESTER", "WEAPON_REPEATER_HENRY", "WEAPON_REPEATER_EVANS",
-		"WEAPON_SHOTGUN_DOUBLEBARREL", "WEAPON_SHOTGUN_DOUBLEBARREL_EXOTIC", "WEAPON_SHOTGUN_PUMP",
-		"WEAPON_SHOTGUN_REPEATING", "WEAPON_SHOTGUN_SAWEDOFF", "WEAPON_SHOTGUN_SEMIAUTO",
-		"WEAPON_SNIPERRIFLE_ROLLINGBLOCK", "WEAPON_SNIPERRIFLE_ROLLINGBLOCK_EXOTIC", "WEAPON_SNIPERRIFLE_CARCANO",
-		"WEAPON_REVOLVER_CATTLEMAN", "WEAPON_REVOLVER_CATTLEMAN_MEXICAN", "WEAPON_REVOLVER_DOUBLEACTION",
-		"WEAPON_REVOLVER_DOUBLEACTION_EXOTIC", "WEAPON_REVOLVER_DOUBLEACTION_GAMBLER", "WEAPON_REVOLVER_LEMAT",
-		"WEAPON_REVOLVER_SCHOFIELD", "WEAPON_REVOLVER_NAVY", "WEAPON_REVOLVER_NAVY_CROSSOVER",
-		"WEAPON_PISTOL_MAUSER", "WEAPON_PISTOL_MAUSER_DRUNK", "WEAPON_PISTOL_SEMIAUTO", "WEAPON_PISTOL_VOLCANIC",
-		"WEAPON_REPEATER_CARBINE_SADIE", "WEAPON_RIFLE_BOLTACTION_EXOTIC",
-		"WEAPON_BOW", "WEAPON_BOW_IMPROVED"
-	};
-	static uint32_t hashes[sizeof(kNames) / sizeof(kNames[0])];
-	static bool init = false;
-	if (!init)
-	{
-		for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); i++) hashes[i] = NFH_Joaat(kNames[i]);
-		init = true;
-	}
-	for (size_t i = 0; i < sizeof(hashes) / sizeof(hashes[0]); i++)
-		if (hashes[i] == (uint32_t)w) return true;
+	s.lockUntil = 0; s.nextCheck = 0; s.blockUntil = 0; s.sideA = 0; s.sideB = 0;
+	s.wheelSel = 0; s.wheelOpenTime = 0; s.wheelSession = false; s.wheelConfirmed = false;
+	NFH_ClearHeld(s);
+}
+
+static void NFH_ResetHistory(NfhState &s)
+{
+	s.prevCur = 0xFFFFFFFF;
+	for (int k = 0; k < 4; k++) { s.slotPrev[k] = 0xFFFFFFFF; s.slotSince[k] = 0; }
+}
+
+static void NFH_Equip(Ped ped, DWORD w)
+{
+	WEAPON::SET_CURRENT_PED_WEAPON(ped, w, TRUE, 0, FALSE, FALSE);
+}
+
+static bool NFH_AnyRemoved(const NfhState &s, int now, DWORD cur, const DWORD w[4])
+{
+	for (int k = 0; k < 4; k++)
+		if (s.slotPrev[k] == cur && s.slotSince[k] != 0 && now - s.slotSince[k] >= 5000 && w[k] != cur) return true;
 	return false;
 }
 
-static bool NFH_IsLongarm(DWORD w)
+static void NFH_TrackSlots(NfhState &s, int now, DWORD cur, const DWORD w[4], DWORD unarmed)
 {
-	static uint32_t bow = NFH_Joaat("WEAPON_BOW"), bowImproved = NFH_Joaat("WEAPON_BOW_IMPROVED");
-	if (w == 0) return false;
-	if (w == bow || w == bowImproved) return true;
-	if (NFH_IsFirearm(w)) return true;
-	return invoke<int>(0x0556E9D2ECF39D01, w) != 0;
-}
-
-static void NFH_ReadBack(Ped ped, DWORD out[4], DWORD unarmed)
-{
-	for (int i = 0; i < 4; i++)
+	if (w[0] != 0 && w[0] != unarmed)
 	{
-		Hash h = 0;
-		WEAPON::GET_CURRENT_PED_WEAPON(ped, &h, FALSE, 7 + i, FALSE);
-		out[i] = (h == (Hash)unarmed) ? 0 : (DWORD)h;
+		if (s.candX != w[0]) s.firstSeenX = now;
+		s.candX = w[0]; s.lastSeenX = now;
 	}
-}
+	else if (s.candX != 0)
+	{
+		if (w[1] == s.candX) s.lastSeenX = now;
+		else if (cur == s.candX || (s.lastSeenX != 0 && now - s.lastSeenX > 5000)) { s.candX = 0; s.lastSeenX = 0; s.firstSeenX = 0; }
+	}
 
-static bool NFH_InList(const DWORD *arr, int n, DWORD w)
-{
-	for (int i = 0; i < n; i++) if (arr[i] == w) return true;
-	return false;
+	if (w[1] != 0 && w[1] != unarmed)
+	{
+		if (s.candY != w[1]) s.firstSeenY = now;
+		s.candY = w[1]; s.lastSeenY = now;
+	}
+	else if (s.candY != 0)
+	{
+		if (w[0] == s.candY) s.lastSeenY = now;
+		else if (cur == s.candY || (s.lastSeenY != 0 && now - s.lastSeenY > 5000)) { s.candY = 0; s.lastSeenY = 0; s.firstSeenY = 0; }
+	}
+
+	for (int k = 0; k < 4; k++)
+		if (w[k] != s.slotPrev[k]) s.slotSince[k] = (w[k] != 0 && w[k] != unarmed) ? now : 0;
+
+	s.prevCur = cur;
+	for (int k = 0; k < 4; k++) s.slotPrev[k] = w[k];
 }
 
 static void NoForcedHolstering_Tick()
 {
-	static bool  s_applied = false;
-	static DWORD s_heldWeapon = 0, s_heldSeen = 0;
-	static DWORD s_lastIntent = 0, s_lastTry = 0, s_lastCfg = 0, s_mountedSince = 0, s_lockAfter = 0;
-	static int   s_tries = 0;
-	static bool  s_wheelWasOpen = false;
-	static DWORD s_wheelSel = 0, s_pendWeapon = 0, s_pendTime = 0;
-	static DWORD s_lastSelect = 0, s_pinWeapon = 0, s_pinUntil = 0, s_lastPinTry = 0;
-	static int   s_pinTries = 0;
-	static DWORD s_slotW[4] = { 0, 0, 0, 0 }, s_slotSince[4] = { 0, 0, 0, 0 };
-	static DWORD s_goneW[4] = { 0, 0, 0, 0 }, s_goneAt[4] = { 0, 0, 0, 0 }, s_goneDur[4] = { 0, 0, 0, 0 };
-	static uint32_t cWheel = 0, cHolster = 0, cNext = 0, cPrev = 0, cHorseAim = 0, cHorseAttack = 0, wUnarmed = 0;
-	static bool init = false;
+	static NfhState s;
+	static bool applied = false, init = false;
+	static DWORD cWheel = 0, cHolster = 0, cAim = 0, cAttack = 0, wUnarmed = 0, wBow = 0, wBowImp = 0;
 
 	Ped ped = PLAYER::PLAYER_PED_ID();
-	bool pedOk = ENTITY::DOES_ENTITY_EXIST(ped) != 0;
+	bool pedOk = ped != 0 && ENTITY::DOES_ENTITY_EXIST(ped);
 
 	if (!g_noForcedHolstering)
 	{
-		if (s_applied && pedOk)
+		if (applied && pedOk)
 		{
 			invoke<Void>(0xBE711B14A159E84F, ped, TRUE);
 			invoke<Void>(0xB832F1A686B9B810, ped, TRUE, 0);
-			PED::SET_PED_CONFIG_FLAG(ped, 141, FALSE);
 		}
-		s_applied = false; s_heldWeapon = 0; s_tries = 0; s_pendWeapon = 0; s_wheelWasOpen = false;
+		applied = false;
+		s = NfhState();
 		return;
 	}
+	if (!pedOk) return;
 
 	if (!init)
 	{
-		cWheel = NFH_Joaat("INPUT_OPEN_WHEEL_MENU");
-		cHolster = NFH_Joaat("INPUT_TOGGLE_HOLSTER");
-		cNext = NFH_Joaat("INPUT_SELECT_NEXT_WEAPON");
-		cPrev = NFH_Joaat("INPUT_SELECT_PREV_WEAPON");
-		cHorseAim = NFH_Joaat("INPUT_HORSE_AIM");
-		cHorseAttack = NFH_Joaat("INPUT_HORSE_ATTACK");
-		wUnarmed = NFH_Joaat("WEAPON_UNARMED");
+		wUnarmed = (DWORD)GAMEPLAY::GET_HASH_KEY((char*)"WEAPON_UNARMED");
+		wBow = (DWORD)GAMEPLAY::GET_HASH_KEY((char*)"WEAPON_BOW");
+		wBowImp = (DWORD)GAMEPLAY::GET_HASH_KEY((char*)"WEAPON_BOW_IMPROVED");
+		cWheel = (DWORD)GAMEPLAY::GET_HASH_KEY((char*)"INPUT_OPEN_WHEEL_MENU");
+		cAim = (DWORD)GAMEPLAY::GET_HASH_KEY((char*)"INPUT_HORSE_AIM");
+		cHolster = (DWORD)GAMEPLAY::GET_HASH_KEY((char*)"INPUT_TOGGLE_HOLSTER");
+		cAttack = (DWORD)GAMEPLAY::GET_HASH_KEY((char*)"INPUT_HORSE_ATTACK");
 		init = true;
 	}
 
-	if (!pedOk || ENTITY::IS_ENTITY_DEAD(ped))
+	int now = GAMEPLAY::GET_GAME_TIMER();
+
+	if (ped != s.lastPed)
 	{
-		s_heldWeapon = 0; s_tries = 0; s_pendWeapon = 0;
-		return;
+		NFH_ResetCommon(s);
+		NFH_ResetHistory(s);
+		s.candX = 0; s.firstSeenX = 0; s.lastSeenX = 0;
+		s.candY = 0; s.firstSeenY = 0; s.lastSeenY = 0;
+		s.wasMounted = false;
+		s.lastPed = ped;
 	}
 
-	s_applied = true;
+	applied = true;
 	invoke<Void>(0xBE711B14A159E84F, ped, FALSE);
 	invoke<Void>(0xB832F1A686B9B810, ped, FALSE, 0);
 
-	DWORD now = (DWORD)GAMEPLAY::GET_GAME_TIMER();
-	if (now - s_lastCfg >= 500)
-	{
-		s_lastCfg = now;
-		PED::SET_PED_CONFIG_FLAG(ped, 141, TRUE);
-	}
+	DWORD cur = 0, w[4] = { 0, 0, 0, 0 };
 
-	bool mounted = PED::IS_PED_ON_MOUNT(ped) != 0;
-	if (!mounted) s_mountedSince = 0;
-	else if (!s_mountedSince) s_mountedSince = now;
-
-	bool wheelOpen = CONTROLS::IS_CONTROL_PRESSED(0, cWheel) || GRAPHICS::ANIMPOSTFX_IS_RUNNING((char*)"WheelHUDIn");
-	bool holsterInput = CONTROLS::IS_CONTROL_PRESSED(0, cHolster) || CONTROLS::IS_CONTROL_JUST_PRESSED(0, cHolster) ||
-		CONTROLS::IS_CONTROL_JUST_RELEASED(0, cHolster);
-	bool intent = wheelOpen || holsterInput ||
-		CONTROLS::IS_CONTROL_JUST_PRESSED(0, cWheel) || CONTROLS::IS_CONTROL_JUST_RELEASED(0, cWheel) ||
-		CONTROLS::IS_CONTROL_JUST_PRESSED(0, cNext) || CONTROLS::IS_CONTROL_JUST_PRESSED(0, cPrev) ||
-		CONTROLS::IS_CONTROL_PRESSED(0, cHorseAim) || CONTROLS::IS_CONTROL_PRESSED(0, cHorseAttack);
-	if (intent)
+	if (!PED::IS_PED_ON_MOUNT(ped))
 	{
-		s_lastIntent = now;
-		s_lockAfter = now + 5000;
-	}
-	if (wheelOpen || CONTROLS::IS_CONTROL_JUST_RELEASED(0, cWheel) ||
-		CONTROLS::IS_CONTROL_JUST_PRESSED(0, cNext) || CONTROLS::IS_CONTROL_JUST_PRESSED(0, cPrev))
-		s_lastSelect = now;
+		if (s.wasMounted) NFH_ResetCommon(s);
+		s.wasMounted = false;
 
-	Hash cur = 0;
-	WEAPON::GET_CURRENT_PED_WEAPON(ped, &cur, FALSE, 0, FALSE);
-
-	if (wheelOpen)
-	{
-		DWORD sel = (DWORD)invoke<Any>(0x9C409BBC492CB5B1);
-		if (sel) s_wheelSel = sel;
-		s_wheelWasOpen = true;
-	}
-	else if (s_wheelWasOpen)
-	{
-		s_wheelWasOpen = false;
-		if (s_wheelSel && s_wheelSel != wUnarmed && (Hash)s_wheelSel != cur)
-		{
-			DWORD back[4]; NFH_ReadBack(ped, back, wUnarmed);
-			if (!NFH_InList(back, 4, s_wheelSel)) { s_pendWeapon = s_wheelSel; s_pendTime = now; }
-		}
-		s_wheelSel = 0;
-	}
-
-	if (s_pendWeapon)
-	{
-		if (now - s_pendTime > 3500 || (DWORD)cur == s_pendWeapon) s_pendWeapon = 0;
-		else if (now - s_pendTime >= 250)
-		{
-			DWORD back[4]; NFH_ReadBack(ped, back, wUnarmed);
-			if (NFH_InList(back, 4, s_pendWeapon))
-			{
-				WEAPON::SET_CURRENT_PED_WEAPON(ped, s_pendWeapon, TRUE, 0, FALSE, FALSE);
-				s_pendWeapon = 0;
-			}
-		}
-	}
-
-	if (mounted)
-	{
-		DWORD bk[4]; NFH_ReadBack(ped, bk, wUnarmed);
+		Hash h = 0;
+		WEAPON::GET_CURRENT_PED_WEAPON(ped, &h, FALSE, 0, FALSE); cur = (DWORD)h;
 		for (int k = 0; k < 4; k++)
 		{
-			if (bk[k] == s_slotW[k]) continue;
-			if (s_slotW[k])
-			{
-				s_goneW[k] = s_slotW[k];
-				s_goneAt[k] = now;
-				s_goneDur[k] = s_slotSince[k] ? now - s_slotSince[k] : 0;
-			}
-			s_slotW[k] = bk[k];
-			s_slotSince[k] = bk[k] ? now : 0;
+			h = 0;
+			WEAPON::GET_CURRENT_PED_WEAPON(ped, &h, FALSE, 7 + k, FALSE);
+			w[k] = (DWORD)h;
 		}
 
-		if (wheelOpen || holsterInput) s_pinWeapon = 0;
+		bool removed = NFH_AnyRemoved(s, now, cur, w);
+		bool bowX = cur == wBow && s.candX == cur && s.firstSeenX != 0 && now - s.firstSeenX >= 5000 &&
+			s.lastSeenX != 0 && now - s.lastSeenX <= 5000 && w[0] != cur && w[1] != cur;
+		bool bowY = cur == wBow && s.candY == cur && s.firstSeenY != 0 && now - s.firstSeenY >= 5000 &&
+			s.lastSeenY != 0 && now - s.lastSeenY <= 5000 && w[0] != cur && w[1] != cur;
 
-		if (cur != 0 && cur != (Hash)wUnarmed && (DWORD)cur != s_pinWeapon && now - s_lastSelect < 4000 && NFH_IsLongarm((DWORD)cur))
-		{
-			for (int k = 0; k < 4; k++)
-			{
-				if ((DWORD)cur != s_goneW[k] || now - s_goneAt[k] > 1500 || s_goneDur[k] < 2000) continue;
-				WEAPON::SET_CURRENT_PED_WEAPON(ped, cur, TRUE, 0, FALSE, FALSE);
-				s_pinWeapon = (DWORD)cur; s_pinUntil = now + 2500; s_pinTries = 0; s_goneW[k] = 0;
-				break;
-			}
-		}
+		if (cur != 0 && cur != wUnarmed && cur != s.prevCur &&
+			((removed && invoke<int>(0x0556E9D2ECF39D01, cur) != 0) || bowX || bowY))
+			NFH_Equip(ped, cur);
 
-		if (s_pinWeapon && now < s_pinUntil && cur == (Hash)wUnarmed && s_pinTries < 4 && now - s_lastPinTry >= 150)
-		{
-			s_lastPinTry = now;
-			s_pinTries++;
-			WEAPON::SET_CURRENT_PED_WEAPON(ped, s_pinWeapon, TRUE, 0, FALSE, FALSE);
-		}
-		if (now >= s_pinUntil) s_pinWeapon = 0;
-	}
-	else
-	{
-		for (int k = 0; k < 4; k++) { s_slotW[k] = 0; s_slotSince[k] = 0; s_goneW[k] = 0; }
-		s_pinWeapon = 0;
-	}
-
-	if (NFH_IsFirearm((DWORD)cur))
-	{
-		s_heldWeapon = (DWORD)cur;
-		s_heldSeen = now;
-		s_tries = 0;
+		NFH_TrackSlots(s, now, cur, w, wUnarmed);
 		return;
 	}
 
-	if (s_heldWeapon != 0)
+	if (!s.wasMounted)
 	{
-		if (now - s_heldSeen > 2500 || (cur != 0 && cur != (Hash)wUnarmed) || now - s_lastIntent < 6000 ||
-			!mounted || now - s_mountedSince < 1500)
+		NFH_ResetCommon(s);
+		NFH_ResetHistory(s);
+		s.wasMounted = true;
+	}
+
+	bool fx = GRAPHICS::ANIMPOSTFX_IS_RUNNING((char*)"WheelHUDIn") != 0;
+	bool wheelJP = CONTROLS::IS_CONTROL_JUST_PRESSED(0, (int)cWheel) != 0;
+	bool wheelPR = CONTROLS::IS_CONTROL_PRESSED(0, (int)cWheel) != 0;
+	bool wheelJR = CONTROLS::IS_CONTROL_JUST_RELEASED(0, (int)cWheel) != 0;
+	bool aimJP = CONTROLS::IS_CONTROL_JUST_PRESSED(0, (int)cAim) != 0;
+	bool holsterJP = CONTROLS::IS_CONTROL_JUST_PRESSED(0, (int)cHolster) != 0;
+	bool attackJP = CONTROLS::IS_CONTROL_JUST_PRESSED(0, (int)cAttack) != 0;
+	bool aimPR = CONTROLS::IS_CONTROL_PRESSED(0, (int)cAim) != 0;
+
+	bool sess = s.wheelSession, conf = s.wheelConfirmed;
+	int t0 = s.wheelOpenTime;
+	DWORD pick = s.wheelSel;
+	if (wheelJP)
+	{
+		t0 = now; sess = true; conf = false; pick = 0;
+		s.wheelOpenTime = now; s.wheelSession = true; s.wheelConfirmed = false; s.wheelSel = 0;
+	}
+
+	bool track = false;
+	if (fx)
+	{
+		s.wheelConfirmed = true; s.wheelSession = true;
+		s.wheelOpenTime = sess ? t0 : now;
+		track = true;
+	}
+	else if (sess && wheelPR && now - t0 >= 180) { s.wheelConfirmed = true; track = true; }
+	else if (conf) track = true;
+
+	if (track && (fx || wheelPR))
+	{
+		DWORD sel = (DWORD)invoke<Any>(0x9C409BBC492CB5B1);
+		if (sel) pick = sel;
+		s.wheelSel = pick;
+	}
+
+	bool justSel = false;
+	DWORD selW = 0;
+	if (wheelJR)
+	{
+		if (s.wheelSession && s.wheelConfirmed)
 		{
-			s_heldWeapon = 0; s_tries = 0;
+			s.blockUntil = 0;
+			justSel = true;
+			DWORD sel = (DWORD)invoke<Any>(0x9C409BBC492CB5B1);
+			s.wheelSession = false; s.wheelConfirmed = false;
+			selW = sel ? sel : s.wheelSel;
+			s.wheelOpenTime = 0;
+		}
+		else { s.wheelSession = false; s.wheelConfirmed = false; s.wheelOpenTime = 0; }
+	}
+
+	if (fx || wheelJP || wheelPR || wheelJR) { s.nextCheck = now + 5000; s.lockUntil = now + 5000; }
+	else if (aimJP || holsterJP || attackJP) s.lockUntil = now + 5000;
+
+	Hash h = 0;
+	WEAPON::GET_CURRENT_PED_WEAPON(ped, &h, FALSE, 0, FALSE); cur = (DWORD)h;
+	for (int k = 0; k < 4; k++)
+	{
+		h = 0;
+		WEAPON::GET_CURRENT_PED_WEAPON(ped, &h, FALSE, 7 + k, FALSE);
+		w[k] = (DWORD)h;
+	}
+	bool armed = invoke<BOOL>(0x2387D6E9C6B478AA, ped) != 0;
+
+	if (wheelJR)
+	{
+		if (justSel)
+		{
+			bool valid = selW != 0 && selW != wUnarmed &&
+				(invoke<int>(0x0556E9D2ECF39D01, selW) != 0 || selW == wBow || selW == wBowImp);
+			if (valid)
+			{
+				if (selW == cur || selW == w[0] || selW == w[1] || selW == w[2] || selW == w[3]) NFH_ClearHeld(s);
+				else
+				{
+					s.heldWeapon = selW; s.heldSince = now; s.heldActive = true; s.heldDone = false;
+					s.rearmA = false; s.rearmB = false;
+				}
+			}
+			else
+			{
+				NFH_ClearHeld(s);
+				s.blockUntil = now + 3500;
+			}
+		}
+		s.wheelSel = 0;
+	}
+
+	bool removed = NFH_AnyRemoved(s, now, cur, w);
+
+	if ((!s.heldActive || now - s.heldSince >= 3500) && now >= s.blockUntil && cur != 0 && cur != wUnarmed &&
+		removed && cur != s.prevCur && invoke<int>(0x0556E9D2ECF39D01, cur) != 0)
+	{
+		s.lockUntil = now + 5000;
+		NFH_Equip(ped, cur);
+	}
+
+	if (s.heldActive)
+	{
+		if (wheelJP || holsterJP)
+		{
+			NFH_ClearHeld(s);
+			s.rearmA = false; s.rearmB = false;
 		}
 		else
 		{
-			if (now - s_lastTry >= 250 && s_tries < 12)
+			DWORD held = s.heldWeapon;
+			int elapsed = now - s.heldSince;
+			bool inSlot = w[0] == held || w[1] == held || w[2] == held || w[3] == held;
+
+			bool tryB = s.rearmA;
+			if (!s.rearmA && cur == held && cur != s.prevCur)
 			{
-				s_lastTry = now;
-				s_tries++;
-				WEAPON::SET_CURRENT_PED_WEAPON(ped, s_heldWeapon, TRUE, 0, FALSE, FALSE);
+				NFH_Equip(ped, cur);
+				s.lockUntil = now + 5000;
+				s.rearmA = true;
+				tryB = true;
 			}
-			return;
+			if (tryB && !s.rearmB && cur != held && !inSlot && elapsed >= 250 && (!armed || elapsed >= 1200))
+			{
+				NFH_Equip(ped, held);
+				s.lockUntil = now + 5000;
+				s.rearmB = true;
+			}
+			if (!s.heldDone && elapsed >= 700 && cur != held && inSlot && (!armed || elapsed >= 1800))
+			{
+				NFH_Equip(ped, held);
+				s.lockUntil = now + 5000;
+				s.heldDone = true;
+			}
+			if (elapsed >= 3500) NFH_ClearHeld(s);
 		}
 	}
 
-	if (mounted && s_pendWeapon == 0 && cur == (Hash)wUnarmed && now > s_lockAfter && !holsterInput)
-		WEAPON::SET_CURRENT_PED_WEAPON(ped, wUnarmed, TRUE, 0, FALSE, FALSE);
+	if (cur == wUnarmed && now > s.lockUntil && !aimPR)
+	{
+		NFH_Equip(ped, cur);
+		s.lockUntil = now + 1;
+	}
+
+	if (now > s.nextCheck)
+	{
+		if (invoke<int>(0x0556E9D2ECF39D01, cur) == 0 && !(s.sideA != 0 && s.sideB != 0) && cur != s.sideA && cur != s.sideB)
+		{
+			if (!(armed || aimPR)) NFH_Equip(ped, cur);
+			if (s.sideA == 0) s.sideA = cur;
+			else if (s.sideB == 0) s.sideB = cur;
+		}
+		s.nextCheck = now + 1;
+	}
+
+	NFH_TrackSlots(s, now, cur, w, wUnarmed);
 }
 
 static void StableNpcCalm_Tick()
@@ -4101,18 +4226,12 @@ static const int kFState      = 14;
 static inline int GIdx(int slot, int field) { return kArrayHeader + 1 + slot * kStride + field; }
 
 static bool   g_enabled = false;
-static constexpr bool g_dryRun = false;
-static string g_dbPath;
 
 static bool RdG64(int idx, uint64_t &out)
 {
 	UINT64 *p = getGlobalPtr(idx);
 	if (!p) return false;
-#ifdef _MSC_VER
 	__try { out = *(volatile uint64_t *)p; } __except (1) { return false; }
-#else
-	out = *(volatile uint64_t *)p;
-#endif
 	return true;
 }
 static bool RdG(int idx, uint32_t &out)
@@ -4126,11 +4245,7 @@ static bool WrG(int idx, uint32_t v)
 {
 	UINT64 *p = getGlobalPtr(idx);
 	if (!p) return false;
-#ifdef _MSC_VER
 	__try { *(volatile uint32_t *)p = v; } __except (1) { return false; }
-#else
-	*(volatile uint32_t *)p = v;
-#endif
 	return true;
 }
 
@@ -4218,7 +4333,7 @@ static const char *kOnlineModels[] = {
 	"A_C_HORSE_TURKOMAN_PERLINO",
 };
 
-enum Family { DONOR_1 = 0, DONOR_2, DONOR_3, DONOR_4, F_COUNT };
+enum { DONOR_1 = 0, DONOR_2, DONOR_3, DONOR_4, F_COUNT };
 struct Donor { const char *name; uint32_t breed, model; };
 static const Donor kDonors[F_COUNT] = {
 	{ "MURFREE_MANGE_01",   0xF1F348C6, 0x36AE742C },
@@ -4252,9 +4367,8 @@ static const OnlineModel *FindOnline(uint32_t model)
 struct MapEntry { bool valid; uint32_t realBreed, realModel; int ownerSlot; };
 static MapEntry g_map[F_COUNT];
 
-static DWORD ResolveApocalypseHorseModel(Ped horse, DWORD visibleModel)
+static DWORD ResolveApocalypseHorseModel(DWORD visibleModel)
 {
-	(void)horse;
 	if (FindOnline(visibleModel)) return visibleModel;
 	for (int d = 0; d < 3; d++)
 	{
@@ -4263,179 +4377,6 @@ static DWORD ResolveApocalypseHorseModel(Ped horse, DWORD visibleModel)
 			return g_map[d].realModel;
 	}
 	return visibleModel;
-}
-
-static string MapLine(int d)
-{
-	char line[200];
-	sprintf_s(line, "%d %08X %08X %08X %08X %d", d, g_map[d].realBreed, g_map[d].realModel, kDonors[d].breed, kDonors[d].model, g_map[d].ownerSlot);
-	string t = line;
-	const OnlineModel *om = FindOnline(g_map[d].realModel);
-	t += "  ; "; t += om ? om->name : string("?"); t += " <- donor "; t += kDonors[d].name;
-	return t;
-}
-
-static bool SaveMapToFile()
-{
-	string tmp = g_dbPath + ".tmp";
-	HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (h == INVALID_HANDLE_VALUE) return false;
-	string txt = "V3\r\n";
-	for (int d = 0; d < F_COUNT; d++) if (g_map[d].valid) txt += MapLine(d) + "\r\n";
-	DWORD w = 0;
-	bool ok = WriteFile(h, txt.data(), (DWORD)txt.size(), &w, nullptr) && w == txt.size();
-	FlushFileBuffers(h);
-	CloseHandle(h);
-	if (!ok) return false;
-	return MoveFileExA(tmp.c_str(), g_dbPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-}
-
-static string g_iniPath;
-
-static bool ReadWholeFile(const string &path, string &out)
-{
-	FILE *f = nullptr;
-	if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return false;
-	char buf[4096]; size_t n;
-	out.clear();
-	while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
-	fclose(f);
-	return true;
-}
-static void SplitLines(const string &src, vector<string> &lines)
-{
-	lines.clear();
-	size_t pos = 0;
-	while (pos < src.size())
-	{
-		size_t e = src.find('\n', pos);
-		string ln = (e == string::npos) ? src.substr(pos) : src.substr(pos, e - pos);
-		if (!ln.empty() && ln.back() == '\r') ln.pop_back();
-		lines.push_back(ln);
-		if (e == string::npos) break;
-		pos = e + 1;
-	}
-}
-static bool IsDbHeader(const string &line)
-{
-	string t = Trim(line);
-	return t.size() == 7 && _strnicmp(t.c_str(), "[Stall]", 7) == 0;
-}
-
-static bool SaveMapToIni()
-{
-	if (g_iniPath.empty()) return false;
-	string src;
-	if (!ReadWholeFile(g_iniPath, src)) return false;
-	const string nl = (src.find("\r\n") != string::npos || src.find('\n') == string::npos) ? "\r\n" : "\n";
-	vector<string> lines, out;
-	SplitLines(src, lines);
-	bool skipping = false;
-	for (size_t i = 0; i < lines.size(); i++)
-	{
-		string t = Trim(lines[i]);
-		if (!skipping)
-		{
-			if (IsDbHeader(lines[i])) { skipping = true; continue; }
-			out.push_back(lines[i]);
-		}
-		else if (!t.empty() && t[0] == '[') { skipping = false; out.push_back(lines[i]); }
-	}
-	while (!out.empty() && Trim(out.back()).empty()) out.pop_back();
-	bool any = false;
-	for (int d = 0; d < F_COUNT; d++) if (g_map[d].valid) any = true;
-	if (any)
-	{
-		out.push_back("");
-		out.push_back("[Stall]");
-		for (int d = 0; d < F_COUNT; d++)
-			if (g_map[d].valid) out.push_back(MapLine(d));
-	}
-	string txt;
-	for (size_t i = 0; i < out.size(); i++) { txt += out[i]; txt += nl; }
-	if (txt == src) return true;
-	string tmp = g_iniPath + ".tmp";
-	HANDLE h = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (h == INVALID_HANDLE_VALUE) return false;
-	DWORD w = 0;
-	bool ok = WriteFile(h, txt.data(), (DWORD)txt.size(), &w, nullptr) && w == txt.size();
-	FlushFileBuffers(h);
-	CloseHandle(h);
-	if (!ok) { DeleteFileA(tmp.c_str()); return false; }
-	if (!MoveFileExA(tmp.c_str(), g_iniPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileA(tmp.c_str()); return false; }
-	return true;
-}
-
-static bool SaveMap()
-{
-	if (SaveMapToIni())
-	{
-		DeleteFileA(g_dbPath.c_str());
-		return true;
-	}
-	return SaveMapToFile();
-}
-
-static void ParseMapLine(const char *line)
-{
-	int d; unsigned rb, rm, db, dm; int ownerSlot = -1;
-	int fields = sscanf_s(line, "%d %x %x %x %x %d", &d, &rb, &rm, &db, &dm, &ownerSlot);
-	if (fields < 5) return;
-	if (d < 0 || d >= F_COUNT) return;
-	if (ownerSlot < 0 || ownerSlot >= kSlots) ownerSlot = -1;
-	g_map[d].valid = true; g_map[d].realBreed = rb; g_map[d].realModel = rm; g_map[d].ownerSlot = ownerSlot;
-}
-
-static int CountMapEntries()
-{
-	int n = 0;
-	for (int d = 0; d < F_COUNT; d++) if (g_map[d].valid) n++;
-	return n;
-}
-
-static int LoadMapFromIni()
-{
-	string src;
-	if (g_iniPath.empty() || !ReadWholeFile(g_iniPath, src)) return 0;
-	vector<string> lines;
-	SplitLines(src, lines);
-	bool inDb = false;
-	for (size_t i = 0; i < lines.size(); i++)
-	{
-		string t = Trim(lines[i]);
-		if (t.empty() || t[0] == ';') continue;
-		if (t[0] == '[') { inDb = IsDbHeader(t); continue; }
-		if (!inDb) continue;
-		ParseMapLine(t.c_str());
-	}
-	return CountMapEntries();
-}
-
-static void LoadMap()
-{
-	for (int d = 0; d < F_COUNT; d++) { g_map[d].valid = false; g_map[d].ownerSlot = -1; }
-	int fromIni = LoadMapFromIni();
-	DWORD attr = GetFileAttributesA(g_dbPath.c_str());
-	bool legacyExists = attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
-	if (fromIni > 0)
-	{
-		if (legacyExists) { DeleteFileA(g_dbPath.c_str());  }
-		return;
-	}
-	if (!legacyExists) return;
-	FILE *f = nullptr;
-	if (fopen_s(&f, g_dbPath.c_str(), "rb") == 0 && f)
-	{
-		char line[240];
-		while (fgets(line, sizeof(line), f)) ParseMapLine(line);
-		fclose(f);
-	}
-	int n = CountMapEntries();
-	if (n > 0 && SaveMapToIni())
-	{
-		DeleteFileA(g_dbPath.c_str());
-	}
-	else if (n == 0) { DeleteFileA(g_dbPath.c_str()); }
 }
 
 static int DonorOfPair(uint32_t breed, uint32_t model);
@@ -4510,11 +4451,7 @@ static bool WrG64(int idx, uint64_t v)
 {
 	UINT64 *p = getGlobalPtr(idx);
 	if (!p) return false;
-#ifdef _MSC_VER
 	__try { *(volatile uint64_t *)p = v; } __except (1) { return false; }
-#else
-	*(volatile uint64_t *)p = v;
-#endif
 	return true;
 }
 static void WriteNameForce(int slot, const string &name)
@@ -4612,21 +4549,14 @@ static void ConvertOnlineSlots()
 			if (g_map[d].valid && g_map[d].realModel == s.model && !DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;
 		for (int d = DONOR_1; d <= DONOR_3 && pick < 0; d++) if (!DonorInUse(d, i)) pick = d;
 		for (int d = 0; d < F_COUNT && pick < 0; d++) if (!DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;
-		if (pick < 0) { continue; }
-
-		if (g_dryRun) continue;
+		if (pick < 0) continue;
 
 		MapEntry old = g_map[pick];
 		g_map[pick].valid = true; g_map[pick].realBreed = realBreed; g_map[pick].realModel = s.model; g_map[pick].ownerSlot = i;
-		if (!SaveMap())
-		{
-			g_map[pick] = old;
-			continue;
-		}
 		if (!WritePair(i, kDonors[pick].breed, kDonors[pick].model))
 		{
 			WritePair(i, s.breed, s.model);
-			g_map[pick] = old; SaveMap();
+			g_map[pick] = old;
 		}
 	}
 }
@@ -4643,8 +4573,7 @@ static void ToReal()
 		if (d < 0 || !g_map[d].valid || !FindOnline(g_map[d].realModel)) continue;
 		int holders = 0;
 		for (int k = 0; k < kSlots; k++) { SlotInfo t = ReadSlot(k); if (t.ok && t.state != 0 && t.breed == s.breed && t.model == s.model) holders++; }
-		if (holders != 1) { continue; }
-		if (g_dryRun) { continue; }
+		if (holders != 1) continue;
 		WritePair(i, g_map[d].realBreed, g_map[d].realModel);
 	}
 }
@@ -4652,7 +4581,6 @@ static void ToReal()
 static void EnterDonorMode()
 {
 	g_donorMode = true;
-	if (g_dryRun) return;
 }
 
 static void ExitDonorMode()
@@ -4670,7 +4598,6 @@ static int DonorOfPair(uint32_t breed, uint32_t model)
 static void MapPrune(bool allow)
 {
 	static DWORD unclaimedSince[F_COUNT] = {};
-	if (g_dryRun) return;
 	if (!allow) { for (int d = 0; d < F_COUNT; d++) unclaimedSince[d] = 0; return; }
 	SlotInfo sl[kSlots];
 	for (int i = 0; i < kSlots; i++) { sl[i] = ReadSlot(i); if (!sl[i].ok) return; }
@@ -4695,24 +4622,21 @@ static void MapPrune(bool allow)
 		if (best >= 0) claim[best] = i;
 	}
 	DWORD now = GetTickCount();
-	bool changed = false;
 	for (int d = 0; d < F_COUNT; d++)
 	{
 		if (!g_map[d].valid) { unclaimedSince[d] = 0; continue; }
 		if (claim[d] >= 0)
 		{
 			unclaimedSince[d] = 0;
-			if (g_map[d].ownerSlot != claim[d]) { g_map[d].ownerSlot = claim[d]; changed = true; }
+			if (g_map[d].ownerSlot != claim[d]) g_map[d].ownerSlot = claim[d];
 			continue;
 		}
 		if (!unclaimedSince[d]) unclaimedSince[d] = now;
 		if (now - unclaimedSince[d] >= 4000)
 		{
-			const OnlineModel *om = FindOnline(g_map[d].realModel);
-			g_map[d].valid = false; g_map[d].ownerSlot = -1; unclaimedSince[d] = 0; changed = true;
+			g_map[d].valid = false; g_map[d].ownerSlot = -1; unclaimedSince[d] = 0;
 		}
 	}
-	if (changed) SaveMap();
 }
 
 static void RetireDonorActiveHorseImpl()
@@ -4763,7 +4687,7 @@ static void RetireMappedDonorPedsImpl()
 {
 	static DWORD nextCheck = 0;
 	DWORD now = GetTickCount();
-	if (now < nextCheck || g_donorMode || g_dryRun) return;
+	if (now < nextCheck || g_donorMode) return;
 	nextCheck = now + 250;
 
 	int nearby[32 + 1]; nearby[0] = 32;
@@ -4811,8 +4735,6 @@ static void RetireMappedDonorPedsImpl()
 		if (donorRecords != 0) continue;
 		if (PED::IS_PED_ON_MOUNT(player) && PED::GET_MOUNT(player) == ped) continue;
 
-		Vector3 pos = ENTITY::GET_ENTITY_COORDS(ped, TRUE, TRUE);
-		int retiredHandle = (int)ped;
 		ENTITY::SET_ENTITY_AS_MISSION_ENTITY(ped, TRUE, TRUE);
 		PED::DELETE_PED(&ped);
 	}
@@ -5806,10 +5728,192 @@ static void ApplyApocalypseAlwaysCleanCalm()
 	}
 }
 
-static constexpr bool g_stats = true;
+static const char *const kBreedVariants[] = {
+	"AMERICANPAINT_GREYOVERO",
+	"AMERICANPAINT_OVERO",
+	"AMERICANPAINT_SPLASHEDWHITE",
+	"AMERICANPAINT_TOBIANO",
+	"AMERICANSTANDARDBRED_BLACK",
+	"AMERICANSTANDARDBRED_BUCKSKIN",
+	"AMERICANSTANDARDBRED_LIGHTBUCKSKIN",
+	"AMERICANSTANDARDBRED_PALOMINODAPPLE",
+	"AMERICANSTANDARDBRED_SILVERTAILBUCKSKIN",
+	"ANDALUSIAN_DARKBAY",
+	"ANDALUSIAN_PERLINO",
+	"ANDALUSIAN_ROSEGRAY",
+	"APPALOOSA_BLACKSNOWFLAKE",
+	"APPALOOSA_BLANKET",
+	"APPALOOSA_BROWNLEOPARD",
+	"APPALOOSA_FEWSPOTTED_PC",
+	"APPALOOSA_LEOPARD",
+	"APPALOOSA_LEOPARDBLANKET",
+	"ARABIAN_BLACK",
+	"ARABIAN_GREY",
+	"ARABIAN_REDCHESTNUT",
+	"ARABIAN_REDCHESTNUT_PC",
+	"ARABIAN_ROSEGREYBAY",
+	"ARABIAN_WARPEDBRINDLE_PC",
+	"ARABIAN_WHITE",
+	"ARDENNES_BAYROAN",
+	"ARDENNES_IRONGREYROAN",
+	"ARDENNES_STRAWBERRYROAN",
+	"BELGIAN_BLONDCHESTNUT",
+	"BELGIAN_MEALYCHESTNUT",
+	"BRETON_GRULLODUN",
+	"BRETON_MEALYDAPPLEBAY",
+	"BRETON_REDROAN",
+	"BRETON_SEALBROWN",
+	"BRETON_SORREL",
+	"BRETON_STEELGREY",
+	"BUELL_WARVETS",
+	"CRIOLLO_BAYBRINDLE",
+	"CRIOLLO_BAYFRAMEOVERO",
+	"CRIOLLO_BLUEROANOVERO",
+	"CRIOLLO_DUN",
+	"CRIOLLO_MARBLESABINO",
+	"CRIOLLO_SORRELOVERO",
+	"DUTCHWARMBLOOD_CHOCOLATEROAN",
+	"DUTCHWARMBLOOD_SEALBROWN",
+	"DUTCHWARMBLOOD_SOOTYBUCKSKIN",
+	"EAGLEFLIES",
+	"GANG_BILL",
+	"GANG_CHARLES",
+	"GANG_CHARLES_ENDLESSSUMMER",
+	"GANG_DUTCH",
+	"GANG_HOSEA",
+	"GANG_JAVIER",
+	"GANG_JOHN",
+	"GANG_KAREN",
+	"GANG_KIERAN",
+	"GANG_LENNY",
+	"GANG_MICAH",
+	"GANG_SADIE",
+	"GANG_SADIE_ENDLESSSUMMER",
+	"GANG_SEAN",
+	"GANG_TRELAWNEY",
+	"GANG_UNCLE",
+	"GANG_UNCLE_ENDLESSSUMMER",
+	"GYPSYCOB_PALOMINOBLAGDON",
+	"GYPSYCOB_PIEBALD",
+	"GYPSYCOB_SKEWBALD",
+	"GYPSYCOB_SPLASHEDBAY",
+	"GYPSYCOB_SPLASHEDPIEBALD",
+	"GYPSYCOB_WHITEBLAGDON",
+	"HUNGARIANHALFBRED_DARKDAPPLEGREY",
+	"HUNGARIANHALFBRED_FLAXENCHESTNUT",
+	"HUNGARIANHALFBRED_LIVERCHESTNUT",
+	"HUNGARIANHALFBRED_PIEBALDTOBIANO",
+	"JOHN_ENDLESSSUMMER",
+	"KENTUCKYSADDLE_BLACK1",
+	"KENTUCKYSADDLE_BUTTERMILKBUCKSKIN_PC",
+	"KENTUCKYSADDLE_CHESTNUTPINTO",
+	"KENTUCKYSADDLE_GREY",
+	"KENTUCKYSADDLE_SILVERBAY",
+	"KLADRUBER_BLACK",
+	"KLADRUBER_CREMELLO",
+	"KLADRUBER_DAPPLEROSEGREY",
+	"KLADRUBER_GREY",
+	"KLADRUBER_SILVER",
+	"KLADRUBER_WHITE",
+	"MANGY_BACKUP",
+	"MISSOURIFOXTROTTER_AMBERCHAMPAGNE",
+	"MISSOURIFOXTROTTER_BLACKTOVERO",
+	"MISSOURIFOXTROTTER_BLUEROAN",
+	"MISSOURIFOXTROTTER_BUCKSKINBRINDLE",
+	"MISSOURIFOXTROTTER_DAPPLEGREY",
+	"MISSOURIFOXTROTTER_SABLECHAMPAGNE",
+	"MISSOURIFOXTROTTER_SILVERDAPPLEPINTO",
+	"MORGAN_BAY",
+	"MORGAN_BAYROAN",
+	"MORGAN_FLAXENCHESTNUT",
+	"MORGAN_LIVERCHESTNUT_PC",
+	"MORGAN_PALOMINO",
+	"MURFREEBROOD_MANGE_01",
+	"MURFREEBROOD_MANGE_02",
+	"MURFREEBROOD_MANGE_03",
+	"MUSTANG_BLACKOVERO",
+	"MUSTANG_BUCKSKIN",
+	"MUSTANG_CHESTNUTTOVERO",
+	"MUSTANG_GOLDENDUN",
+	"MUSTANG_GRULLODUN",
+	"MUSTANG_REDDUNOVERO",
+	"MUSTANG_TIGERSTRIPEDBAY",
+	"MUSTANG_WILDBAY",
+	"NOKOTA_BLUEROAN",
+	"NOKOTA_REVERSEDAPPLEROAN",
+	"NOKOTA_WHITEROAN",
+	"NORFOLKROADSTER_BLACK",
+	"NORFOLKROADSTER_DAPPLEDBUCKSKIN",
+	"NORFOLKROADSTER_PIEBALDROAN",
+	"NORFOLKROADSTER_ROSEGREY",
+	"NORFOLKROADSTER_SPECKLEDGREY",
+	"NORFOLKROADSTER_SPOTTEDTRICOLOR",
+	"SHIRE_DARKBAY",
+	"SHIRE_LIGHTGREY",
+	"SHIRE_RAVENBLACK",
+	"SUFFOLKPUNCH_REDCHESTNUT",
+	"SUFFOLKPUNCH_SORREL",
+	"TENNESSEEWALKER_BLACKRABICANO",
+	"TENNESSEEWALKER_CHESTNUT",
+	"TENNESSEEWALKER_DAPPLEBAY",
+	"TENNESSEEWALKER_FLAXENROAN",
+	"TENNESSEEWALKER_GOLDPALOMINO_PC",
+	"TENNESSEEWALKER_MAHOGANYBAY",
+	"TENNESSEEWALKER_REDROAN",
+	"THOROUGHBRED_BLACKCHESTNUT",
+	"THOROUGHBRED_BLOODBAY",
+	"THOROUGHBRED_BRINDLE",
+	"THOROUGHBRED_DAPPLEGREY",
+	"THOROUGHBRED_REVERSEDAPPLEBLACK",
+	"TURKOMAN_BLACK",
+	"TURKOMAN_CHESTNUT",
+	"TURKOMAN_DARKBAY",
+	"TURKOMAN_GOLD",
+	"TURKOMAN_GREY",
+	"TURKOMAN_PERLINO",
+	"TURKOMAN_SILVER",
+	"WINTER02_01",
+};
+
+static const char *const kModelOverride[][2] = {
+	{ "KENTUCKYSADDLE_BLACK1", "A_C_HORSE_KENTUCKYSADDLE_BLACK" },
+	{ "MANGY_BACKUP", "A_C_HORSE_MP_MANGY_BACKUP" },
+};
+
+struct HorseName { uint32_t hash; string name; string alt; };
+static vector<HorseName> g_horseNames;
+
+static void AddHorseName(const string &name, const string &key)
+{
+	uint32_t h = Joaat(name.c_str());
+	for (size_t i = 0; i < g_horseNames.size(); i++) if (g_horseNames[i].hash == h) return;
+	const string suffix = name.compare(0, 10, "A_C_HORSE_") == 0 ? name.substr(10) : name;
+	HorseName hn = { h, name, key == suffix ? string() : key };
+	g_horseNames.push_back(hn);
+}
+
+static const HorseName *HorseNameOf(uint32_t model)
+{
+	if (g_horseNamesDirty)
+	{
+		g_horseNames.clear();
+		for (size_t i = 0; i < sizeof(kBreedVariants) / sizeof(kBreedVariants[0]); i++)
+		{
+			string model = string("A_C_HORSE_") + kBreedVariants[i];
+			for (size_t k = 0; k < sizeof(kModelOverride) / sizeof(kModelOverride[0]); k++)
+				if (!strcmp(kBreedVariants[i], kModelOverride[k][0])) model = kModelOverride[k][1];
+			AddHorseName(model, kBreedVariants[i]);
+		}
+		for (size_t i = 0; i < sizeof(kOnlineModels) / sizeof(kOnlineModels[0]); i++) AddHorseName(kOnlineModels[i], "");
+		for (size_t i = 0; i < g_customStats.size(); i++) AddHorseName("A_C_HORSE_" + g_customStats[i].breed, g_customStats[i].breed);
+		g_horseNamesDirty = false;
+	}
+	for (size_t i = 0; i < g_horseNames.size(); i++) if (g_horseNames[i].hash == model) return &g_horseNames[i];
+	return nullptr;
+}
+
 static void ApplyOnlineStats()
 {
-	if (!g_stats) return;
 	static DWORD last = 0;
 	DWORD now = GetTickCount();
 	if (now - last < 500) return;
@@ -5821,17 +5925,27 @@ static void ApplyOnlineStats()
 	{
 		Ped ped = (Ped)buf[i + 1];
 		if (!ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped)) continue;
-		const OnlineModel *om = FindOnline((uint32_t)ENTITY::GET_ENTITY_MODEL(ped));
-		if (!om) continue;
+		uint32_t model = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
+		int d = -1;
+		for (int k = 0; k < F_COUNT; k++) if (kDonors[k].model == model) d = k;
+		if (d >= 0 && g_map[d].valid && DonorHeld(d)) continue;
 		if (g_perfectHorses != 0 && IsApocalypseHorse(ped))
 		{
 			ApplyPerfectHorseStats(ped);
 			continue;
 		}
-		const HorseStat *st = StatsFor(om->name);
-		if (!st) continue;
+		const HorseName *hn = HorseNameOf(model);
+		if (!hn) continue;
+		const OnlineModel *om = FindOnline(model);
+		int stat[4];
+		if (!CustomStatsFor(hn->name, hn->alt, stat))
+		{
+			const HorseStat *st = om ? StatsFor(hn->name) : nullptr;
+			if (!st) continue;
+			stat[0] = st->health; stat[1] = st->stamina; stat[2] = st->speed; stat[3] = st->acc;
+		}
 		static const int attr[4] = { 0, 1, 5, 6 };
-		const int want[4] = { st->health - 1, st->stamina - 1, st->speed - 1, st->acc - 1 };
+		const int want[4] = { stat[0] - 1, stat[1] - 1, stat[2] - 1, stat[3] - 1 };
 		int cur[4]; bool diff = false;
 		for (int k = 0; k < 4; k++)
 		{
@@ -6063,24 +6177,10 @@ static void BlanketRemover_Tick()
 	}
 }
 
-void OnlineHorses_Init(const char *iniPath)
+void OnlineHorses_Init()
 {
-	char dir[MAX_PATH];
-	GetModuleFileNameA(g_hModule, dir, MAX_PATH);
-	string base(dir);
-	size_t sl = base.find_last_of("\\/");
-	base = (sl == string::npos) ? string() : base.substr(0, sl + 1);
-	g_dbPath  = base + "Dreamaker-Mod.db";   // legacy location
-	g_iniPath = (iniPath && *iniPath) ? string(iniPath) : base + "Dreamaker-Mod.ini";
-
-	g_hud = true;
-
-	g_online.clear();
 	for (size_t i = 0; i < sizeof(kOnlineModels) / sizeof(kOnlineModels[0]); i++)
 	{ OnlineModel m = { Joaat(kOnlineModels[i]), BreedOf(kOnlineModels[i]), string(kOnlineModels[i]) }; g_online.push_back(m); }
-
-	LoadMap();
-	g_enabled = false;
 
 	uint32_t hdr = 0;
 	if (!RdG(kArrayHeader, hdr) || hdr != (uint32_t)kSlots) return;
@@ -6090,7 +6190,7 @@ void OnlineHorses_Init(const char *iniPath)
 		if (!s.ok || s.state > 2) return;
 	}
 
-	if (!g_dryRun) ToReal();
+	ToReal();
 	RenameNewlyAcquired();
 
 	g_enabled = true;
@@ -6566,17 +6666,9 @@ namespace StoryHorseRename
 		return CodePtr(pages, size, start);
 	}
 
-#ifdef _MSC_VER
-	#define SHR_TRY    __try
-	#define SHR_CATCH  __except (EXCEPTION_EXECUTE_HANDLER)
-#else
-	#define SHR_TRY
-	#define SHR_CATCH  if (false)
-#endif
-
 	static int TryPatch(GetScrProgramFn getProgram, uint32_t hash)
 	{
-		SHR_TRY
+		__try
 		{
 			uint8_t *prog = (uint8_t *)getProgram(hash);
 			if (!prog) return ST_NOT_LOADED;
@@ -6594,7 +6686,7 @@ namespace StoryHorseRename
 			VirtualProtect(dst, sizeof(kPatch), oldProt, &tmp);
 			return ST_PATCHED;
 		}
-		SHR_CATCH
+		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
 			return ST_FAULT;
 		}
