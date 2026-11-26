@@ -10,9 +10,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <new>
 
 using namespace std;
 
+static void Satchel_Restore();
+static void Satchel_CancelScan();
+static bool Satchel_ReapScan();
 static bool SniperHook_Initialize();
 static void SniperHook_SetDisguised(bool disguised);
 void SniperHook_Shutdown();
@@ -47,6 +54,12 @@ BOOL APIENTRY DllMain(HMODULE hInstance, DWORD reason, LPVOID lpReserved)
 		keyboardHandlerRegister(OnKeyboardMessage);
 		break;
 	case DLL_PROCESS_DETACH:
+		if (!lpReserved)
+		{
+			Satchel_CancelScan();
+			Satchel_ReapScan();
+			Satchel_Restore();
+		}
 		SniperHook_Shutdown();
 		scriptUnregister(hInstance);
 		keyboardHandlerUnregister(OnKeyboardMessage);
@@ -86,11 +99,11 @@ int g_noForcedHolstering = 0;
 int g_autoRename = 0;
 int g_blanketRemover = 0;
 
-int g_perfectHorses = 0;
-int g_perfectHorsesHealth = 0;
-int g_perfectHorsesStamina = 0;
-int g_perfectHorsesSpeed = 0;
-int g_perfectHorsesAcceleration = 0;
+int g_perfectHorses = 1;
+int g_perfectHorsesHealth = 6;
+int g_perfectHorsesStamina = 6;
+int g_perfectHorsesSpeed = 7;
+int g_perfectHorsesAcceleration = 7;
 int g_apocalypseVisuals = 1;
 
 const int KEYS_SIZE = 255;
@@ -153,31 +166,17 @@ void ResetKeyState(DWORD key)
 		memset(&keyStates[key], 0, sizeof(keyStates[0]));
 }
 
-struct ApocalypseModelInfo
-{
-	DWORD modelHash = 0;
-	int genderRequired = -1;
-};
 struct ApocalypseHorseEntry
 {
 	string name;
-	vector<ApocalypseModelInfo> models;
+	vector<DWORD> models;
 	vector<string> requiredNames;
 
 	bool MatchesModel(DWORD modelHash) const
 	{
-		for (size_t i = 0; i < models.size(); i++)
-			if (models[i].modelHash == modelHash) return true;
+		for (DWORD model : models)
+			if (model == modelHash) return true;
 		return false;
-	}
-
-	bool HasRequiredNames() const { return !requiredNames.empty(); }
-
-	int GetGenderRequired(DWORD modelHash) const
-	{
-		for (size_t i = 0; i < models.size(); i++)
-			if (models[i].modelHash == modelHash) return models[i].genderRequired;
-		return -1;
 	}
 };
 static vector<ApocalypseHorseEntry> g_apocalypseHorses;
@@ -185,6 +184,7 @@ static vector<ApocalypseHorseEntry> g_apocalypseHorses;
 struct PerfectHorseOriginalStats
 {
 	Ped horse;
+	DWORD model;
 	int baseRanks[4];
 	int bonusRanks[4];
 };
@@ -198,7 +198,7 @@ struct HorseEntry
 	int price;
 	string displayName;
 	string priceDisplay;
-	int gender = -1; // -1 = default, 0 = female, 1 = male
+	int gender = -1;
 };
 
 struct StableZone
@@ -235,7 +235,7 @@ struct SpawnEntry
 	string model;
 	float x = 0, y = 0, z = 0, w = 0;
 	bool hasHeading = false;
-	int gender = -1; // -1 = default, 0 = female, 1 = male
+	int gender = -1;
 };
 static vector<SpawnEntry> g_startSpawns;
 
@@ -276,7 +276,7 @@ static bool         g_bankF2Held      = false;
 static bool         g_pasteWasDownBK     = false;
 
 static vector<string> g_bankPhraseDates;
-static const int CASH_CHEAT_AMOUNT = 50000; // $500 in cents
+static const int CASH_CHEAT_AMOUNT = 50000;
 
 static string GetWindowsDate()
 {
@@ -342,63 +342,11 @@ static bool ClearHorsesNearPoint(float x, float y, float radius)
 	return true;
 }
 
-static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse);
-static DWORD ResolveApocalypseHorseModel(DWORD visibleModel);
+static const ApocalypseHorseEntry *FindApocalypseHorse(Ped horse, DWORD *resolvedModel = nullptr);
 static string TrimText(const char *text);
 static string LocalizedBreedName(const string &suffix);
 static string LocalizedGenderName(const string &genderKey);
 static string LocalizedMenuTitle(const char *labelKey, const char *fallback);
-static bool PedNicknameMatchesInShop(const ApocalypseHorseEntry &entry, Ped horse);
-static Ped g_shopShownPed = 0;
-static int g_shopShownSlot = -1;
-static bool ApocalypseEntryMatchesHorse(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
-{
-	if (!entry.MatchesModel(modelHash)) return false;
-
-	int genderRequired = entry.GetGenderRequired(modelHash);
-	if (genderRequired >= 0)
-	{
-		float exprValue = invoke<float>(0xFD1BA1EEF7985BB8, horse, 0xA28B);
-		int horseGender = (exprValue < 0.5f) ? 1 : 0;
-		if (horseGender != genderRequired) return false;
-	}
-	return PedNicknameMatches(entry, horse);
-}
-
-static bool ApocalypseEntryMatchesModelGender(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
-{
-	if (!entry.MatchesModel(modelHash)) return false;
-
-	int genderRequired = entry.GetGenderRequired(modelHash);
-	if (genderRequired >= 0)
-	{
-		float exprValue = invoke<float>(0xFD1BA1EEF7985BB8, horse, 0xA28B);
-		int horseGender = (exprValue < 0.5f) ? 1 : 0;
-		if (horseGender != genderRequired) return false;
-	}
-	return true;
-}
-
-static bool ApocalypseEntryMatchesContext(const ApocalypseHorseEntry &entry, Ped horse, DWORD modelHash)
-{
-	if (ApocalypseEntryMatchesHorse(entry, horse, modelHash)) return true;
-	if (!StableShopUiActive()) return false;
-	if (!ApocalypseEntryMatchesModelGender(entry, horse, modelHash)) return false;
-	return PedNicknameMatchesInShop(entry, horse);
-}
-
-static bool IsApocalypseHorse(Ped horse)
-{
-	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
-
-	DWORD visibleModel = ENTITY::GET_ENTITY_MODEL(horse);
-	DWORD modelHash = ResolveApocalypseHorseModel(visibleModel);
-
-	for (size_t i = 0; i < g_apocalypseHorses.size(); i++)
-		if (ApocalypseEntryMatchesContext(g_apocalypseHorses[i], horse, modelHash)) return true;
-
-	return false;
-}
 
 static void RestorePerfectHorseStats(Ped horse)
 {
@@ -407,7 +355,8 @@ static void RestorePerfectHorseStats(Ped horse)
 	{
 		if (g_perfectHorseOriginalStats[i].horse != horse) continue;
 
-		if (ENTITY::DOES_ENTITY_EXIST(horse))
+		if (ENTITY::DOES_ENTITY_EXIST(horse) &&
+			ENTITY::GET_ENTITY_MODEL(horse) == g_perfectHorseOriginalStats[i].model)
 		{
 			for (int j = 0; j < 4; j++)
 			{
@@ -421,21 +370,23 @@ static void RestorePerfectHorseStats(Ped horse)
 	}
 }
 
-static void ApplyPerfectHorseStats(Ped horse)
+static bool ApplyPerfectHorseStats(Ped horse)
 {
-	if (g_perfectHorses == 0 || !IsApocalypseHorse(horse))
+	if (g_perfectHorses == 0 || !FindApocalypseHorse(horse))
 	{
 		RestorePerfectHorseStats(horse);
-		return;
+		return false;
 	}
 
 	const int attributes[] = { 0, 1, 5, 6 };
+	const DWORD model = ENTITY::GET_ENTITY_MODEL(horse);
 	bool hasOriginalStats = false;
 	for (size_t i = 0; i < g_perfectHorseOriginalStats.size(); i++)
 	{
 		if (g_perfectHorseOriginalStats[i].horse == horse)
 		{
-			hasOriginalStats = true;
+			hasOriginalStats = g_perfectHorseOriginalStats[i].model == model;
+			if (!hasOriginalStats) RestorePerfectHorseStats(horse);
 			break;
 		}
 	}
@@ -444,6 +395,7 @@ static void ApplyPerfectHorseStats(Ped horse)
 	{
 		PerfectHorseOriginalStats originalStats;
 		originalStats.horse = horse;
+		originalStats.model = model;
 		for (int i = 0; i < 4; i++)
 		{
 			originalStats.baseRanks[i] = (int)ATTRIBUTE::_0x147149F2E909323C(horse, attributes[i]);
@@ -467,6 +419,7 @@ static void ApplyPerfectHorseStats(Ped horse)
 
 	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 5, (float)g_perfectHorsesSpeed, FALSE);
 	ATTRIBUTE::_0xF6A7C08DF2E28B28(horse, 6, (float)g_perfectHorsesAcceleration, FALSE);
+	return true;
 }
 
 static Ped SpawnOneHorse(const SpawnEntry &s, int forceGender = -1)
@@ -784,86 +737,57 @@ static void LoadKeysFromIni(const string &iniPath)
 	g_blanketRemover = GetPrivateProfileIntA("Config", "Blanket_Remover", 0, iniPath.c_str());
 
 	g_autoRename = GetPrivateProfileIntA("Config", "AutoRename", 0, iniPath.c_str());
-	g_perfectHorses = 0;
-	g_perfectHorsesHealth = 0;
-	g_perfectHorsesStamina = 0;
-	g_perfectHorsesSpeed = 0;
-	g_perfectHorsesAcceleration = 0;
 	g_apocalypseVisuals = GetPrivateProfileIntA("ApocalypseHorses", "CustomVisuals", 1, iniPath.c_str());
 	g_apocalypseHorses.clear();
 
-	char perfectHorsesBuf[256];
-	GetPrivateProfileStringA("ApocalypseHorses", "PerfectHorses", "", perfectHorsesBuf, sizeof(perfectHorsesBuf), iniPath.c_str());
-	if (strlen(perfectHorsesBuf) > 0)
+	static const struct
 	{
-		string phStr(perfectHorsesBuf);
-		stringstream ss(phStr);
-		string param;
-		while (getline(ss, param, '|'))
-		{
-			param = Trim(param);
-			size_t colonPos = param.find(':');
-			if (colonPos != string::npos)
-			{
-				string key = Trim(param.substr(0, colonPos));
-				int value = atoi(Trim(param.substr(colonPos + 1)).c_str());
-				if (value < 1) value = 1;
-				if (value > 9) value = 9;
+		const char *name;
+		DWORD models[7];
+		const char *nicknames[4];
+	} apocalypseHorses[] = {
+		{ "Death", { 0x7E4DF66E }, { "Death", "Death Horse", "Morte" } },
+		{ "Famine", { 0xB57D0193, 0x9FA968B5, 0x88D6A59E, 0xF1430568, 0x3C0E4E87, 0x88828382, 0x2FD9844A },
+			{ "Famine", "Famine Horse", "Fome", "Faminto" } },
+		{ "Pestilence", { 0xC8DA3400, 0xF867D7E4 }, { "Pestilence", "Pestilence Horse", "Peste" } },
+		{ "War", { 0xA52D4FC0, 0x9B099788 }, { "War", "War Horse", "Guerra" } },
+	};
 
-				if (key == "Health") g_perfectHorsesHealth = value;
-				else if (key == "Stamina") g_perfectHorsesStamina = value;
-				else if (key == "Speed") g_perfectHorsesSpeed = value;
-				else if (key == "Acceleration") g_perfectHorsesAcceleration = value;
-			}
-			else if (!param.empty())
-			{
-				g_perfectHorses = atoi(param.c_str());
-			}
-		}
-	}
-
-	const char *apocalypseHorseNames[] = { "Death", "Famine", "Pestilence", "War" };
-	for (size_t i = 0; i < sizeof(apocalypseHorseNames) / sizeof(apocalypseHorseNames[0]); i++)
+	for (const auto &horse : apocalypseHorses)
 	{
-		string horseKey = string(apocalypseHorseNames[i]) + "Horse";
+		string horseKey = string(horse.name) + "Horse";
 		char modelBuf[2048];
-		GetPrivateProfileStringA("ApocalypseHorses", horseKey.c_str(), "", modelBuf, sizeof(modelBuf), iniPath.c_str());
-		string modelListStr = Trim(string(modelBuf));
-		if (modelListStr.empty()) continue;
+		GetPrivateProfileStringA("ApocalypseHorses", horseKey.c_str(), "*", modelBuf, sizeof(modelBuf), iniPath.c_str());
 
 		ApocalypseHorseEntry entry;
-		entry.name = apocalypseHorseNames[i];
-		stringstream modelStream(modelListStr);
-		string modelToken;
-		while (getline(modelStream, modelToken, '|'))
+		entry.name = horse.name;
+		if (strcmp(modelBuf, "*") == 0)
 		{
-			string modelStr = Trim(modelToken);
-			if (modelStr.empty()) continue;
-
-			int genderRequired = -1;
-			size_t colonPos = modelStr.rfind(':');
-			if (colonPos != string::npos && colonPos + 1 < modelStr.size())
-			{
-				string genderSuffix = modelStr.substr(colonPos + 1);
-				if (genderSuffix == "0") genderRequired = 0;
-				else if (genderSuffix == "1") genderRequired = 1;
-				modelStr = modelStr.substr(0, colonPos);
-			}
-
-			DWORD modelHash = (DWORD)strtoul(modelStr.c_str(), nullptr, 0);
-			if (modelHash == 0) continue;
-
-			ApocalypseModelInfo mi;
-			mi.modelHash = modelHash;
-			mi.genderRequired = genderRequired;
-			entry.models.push_back(mi);
+			for (DWORD model : horse.models)
+				if (model != 0) entry.models.push_back(model);
 		}
-		if (horseKey == "DeathHorse") entry.requiredNames = vector<string>{ "Death", "Death Horse", "Morte" };
-		else if (horseKey == "FamineHorse") entry.requiredNames = vector<string>{ "Famine", "Famine Horse", "Fome", "Faminto" };
-		else if (horseKey == "PestilenceHorse") entry.requiredNames = vector<string>{ "Pestilence", "Pestilence Horse", "Peste" };
-		else if (horseKey == "WarHorse") entry.requiredNames = vector<string>{ "War", "War Horse", "Guerra" };
-		if (entry.models.empty()) continue;
-		g_apocalypseHorses.push_back(entry);
+		else
+		{
+			stringstream modelStream(modelBuf);
+			string modelToken;
+			while (getline(modelStream, modelToken, '|'))
+			{
+				string modelStr = Trim(modelToken);
+				size_t colon = modelStr.find(':');
+				if (colon == string::npos || Trim(modelStr.substr(colon + 1)) != "1") continue;
+
+				string hashStr = Trim(modelStr.substr(0, colon));
+				char *end = nullptr;
+				DWORD model = (DWORD)strtoul(hashStr.c_str(), &end, 0);
+				if (model == 0 || *end != '\0' || entry.MatchesModel(model)) continue;
+				for (DWORD allowedModel : horse.models)
+					if (allowedModel == model) entry.models.push_back(model);
+			}
+		}
+
+		for (const char *nickname : horse.nicknames)
+			if (nickname) entry.requiredNames.push_back(nickname);
+		if (!entry.models.empty()) g_apocalypseHorses.push_back(entry);
 	}
 }
 
@@ -929,9 +853,820 @@ static bool CustomStatsFor(const string &modelName, const string &alt, int out[4
 	return true;
 }
 
+static uint32_t Joaat(const char *s);
+
+struct SatchelLimits
+{
+	int64_t value[3] = {};
+};
+
+struct SatchelRecord
+{
+	uintptr_t item = 0;
+	uintptr_t fields[3] = {};
+	SatchelLimits limits;
+};
+
+struct SatchelSetting
+{
+	string name;
+	SatchelLimits limits;
+	bool resolved = false;
+};
+
+struct SatchelEdit
+{
+	uint32_t hash;
+	SatchelRecord original;
+	SatchelLimits applied;
+};
+
+static constexpr uintptr_t kSatchelItemId = 0x08;
+static constexpr uintptr_t kSatchelItemDescriptionId = 0x70;
+static constexpr uintptr_t kSatchelRules = 0x98;
+static constexpr uintptr_t kSatchelRuleSize = 0x18;
+static constexpr uintptr_t kSatchelRuleValue = 0x08;
+static constexpr uintptr_t kSatchelRuleTag = 0x10;
+static constexpr size_t kSatchelScanSize = 256 * 1024;
+static constexpr size_t kSatchelHashBuckets = 1 << 12;
+
+static std::unordered_map<uint32_t, SatchelSetting> g_satchelSettings;
+static SatchelLimits g_satchelGlobalLimits;
+static std::unordered_set<uint32_t> g_satchelGlobalResolved;
+static vector<SatchelEdit> g_satchelEdits;
+static constexpr size_t kSatchelScanLookahead = kSatchelRules - kSatchelItemId + 16;
+static constexpr LONG kSatchelQueueSize = 256;
+
+struct SatchelCandidate
+{
+	uintptr_t item;
+	uint32_t hash;
+};
+
+struct SatchelScan
+{
+	HMODULE module = nullptr;
+	volatile LONG references = 2;
+	volatile LONG cancelled = 0, done = 0;
+	volatile LONG head = 0, tail = 0;
+	bool global = false;
+	vector<SatchelCandidate> cached;
+	bool hashBuckets[kSatchelHashBuckets] = {};
+	SatchelCandidate queue[kSatchelQueueSize];
+	uint64_t buffer[(kSatchelScanSize + kSatchelScanLookahead) / sizeof(uint64_t)];
+};
+
+static SatchelScan *g_satchelScan = nullptr;
+static vector<SatchelCandidate> g_satchelPendingTrim;
+static std::unordered_map<uint32_t, uintptr_t> g_satchelCachedItems;
+static size_t g_satchelRemaining = 0;
+static bool g_satchelWasPlaying = false;
+static bool g_satchelScanRequested = false;
+static bool g_satchelRetried = false;
+static ULONGLONG g_satchelNextPoll = 0;
+static ULONGLONG g_satchelInactiveSince = 0;
+
+static bool Satchel_Read(uintptr_t address, void *buffer, size_t size)
+{
+	SIZE_T copied = 0;
+	return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void *>(address),
+		buffer, size, &copied) && copied == size;
+}
+
+template<typename T>
+static bool Satchel_Read(uintptr_t address, T &value)
+{
+	return Satchel_Read(address, &value, sizeof(value));
+}
+
+static bool Satchel_CheckSchema(uintptr_t image, uintptr_t schema, uint32_t name,
+	size_t index, uint32_t member, uint32_t offset, uint32_t type, uint32_t stride = 0)
+{
+	uint32_t schemaName = 0, memberName = 0, memberOffset = 0, memberStride = 0;
+	uint16_t memberType = 0;
+	uintptr_t members = 0, offsets = 0, definition = 0;
+	const uintptr_t end = image + 0x07397600;
+	return Satchel_Read(image + schema, schemaName) && schemaName == name &&
+		Satchel_Read(image + schema + 0x18, members) && members >= image && members < end &&
+		Satchel_Read(image + schema + 0x20, offsets) && offsets >= image && offsets < end &&
+		Satchel_Read(members + index * sizeof(uintptr_t), definition) &&
+		definition >= image && definition < end &&
+		Satchel_Read(offsets + index * sizeof(uint32_t), memberOffset) && memberOffset == offset &&
+		Satchel_Read(definition, memberName) && memberName == member &&
+		Satchel_Read(definition + 0x10, memberType) && memberType == type &&
+		(!stride || (Satchel_Read(definition + 0x20, memberStride) && memberStride == stride));
+}
+
+static bool Satchel_SupportedBuild()
+{
+	const uintptr_t game = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	uint32_t timestamp = 0;
+	return game && Satchel_Read(game + 0x1A8, timestamp) && timestamp == 0x65EEC92E &&
+		Satchel_CheckSchema(game, 0x39D9BE8, 0xEDD9A017, 0, 0xE9806307, kSatchelItemId, 0x070B) &&
+		Satchel_CheckSchema(game, 0x39D9BE8, 0xEDD9A017, 11, 0x1B2D32DB, 0x68, 0x000C) &&
+		Satchel_CheckSchema(game, 0x39D9A88, 0xFBA959EC, 0, 0xE9806307, 0x08, 0x070B) &&
+		Satchel_CheckSchema(game, 0x39D9BE8, 0xEDD9A017, 12, 0xBB4D7354, kSatchelRules, 0x000D, kSatchelRuleSize) &&
+		Satchel_CheckSchema(game, 0x39D9AC0, 0x0B32DDE5, 0, 0x9EA8B8F4, kSatchelRuleValue, 0x001F) &&
+		Satchel_CheckSchema(game, 0x39D9AC0, 0x0B32DDE5, 1, 0xAC2F285C, kSatchelRuleTag, 0x070B);
+}
+
+static void Satchel_Log(const string &message)
+{
+	OutputDebugStringA(("[Dreamaker Satchel] " + message + "\n").c_str());
+}
+
+static uint32_t Satchel_ItemHash(const string &key)
+{
+	if (key.size() >= 2 && key[0] == '0' && (key[1] == 'x' || key[1] == 'X'))
+	{
+		if (key.size() != 10 || key.find_first_not_of("0123456789ABCDEFabcdef", 2) != string::npos)
+			return 0;
+		return static_cast<uint32_t>(strtoul(key.c_str() + 2, nullptr, 16));
+	}
+	if (key.empty() || key.find_first_not_of(
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") != string::npos)
+		return 0;
+	return Joaat(key.c_str());
+}
+
+static bool Satchel_ParseLimits(const string &text, SatchelLimits &limits)
+{
+	constexpr int64_t maximum = 99;
+	size_t start = 0;
+	for (size_t i = 0; i < 3; ++i)
+	{
+		const size_t end = text.find(',', start);
+		if ((i == 2) != (end == string::npos)) return false;
+		const string number = Trim(text.substr(start, end == string::npos ? end : end - start));
+		if (number.empty() || number.find_first_not_of("0123456789") != string::npos) return false;
+		int64_t value = 0;
+		for (char digit : number)
+		{
+			value = 10 * value + digit - '0';
+			if (value >= maximum)
+			{
+				value = maximum;
+				break;
+			}
+		}
+		if (!value || (i && value < limits.value[i - 1])) return false;
+		limits.value[i] = value;
+		if (i != 2) start = end + 1;
+	}
+	return true;
+}
+
+static bool Satchel_HasGlobalLimits()
+{
+	return g_satchelGlobalLimits.value[0] != 0;
+}
+
+static bool Satchel_SameLimits(const SatchelLimits &a, const SatchelLimits &b)
+{
+	return memcmp(a.value, b.value, sizeof(a.value)) == 0;
+}
+
+static void Satchel_LoadConfig(const string &iniPath)
+{
+	std::unordered_map<uint32_t, SatchelSetting> settings;
+	std::unordered_set<uint32_t> seen;
+	SatchelLimits globalLimits;
+	bool globalSeen = false;
+	std::ifstream in(iniPath, std::ios::binary);
+	bool active = false;
+	unsigned lineNumber = 0;
+	string line;
+	while (std::getline(in, line))
+	{
+		++lineNumber;
+		if (lineNumber == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+		const size_t comment = line.find_first_of(";#");
+		if (comment != string::npos) line.erase(comment);
+		line = Trim(line);
+		if (line.empty()) continue;
+		if (line[0] == '[')
+		{
+			active = _stricmp(line.c_str(), "[Satchel]") == 0;
+			continue;
+		}
+		if (!active) continue;
+
+		const size_t separator = line.find('=');
+		const string key = Trim(line.substr(0, separator));
+		if (_stricmp(key.c_str(), "Carrying_Capacity") == 0)
+		{
+			SatchelLimits limits;
+			if (globalSeen)
+			{
+				globalLimits = SatchelLimits{};
+				Satchel_Log("Duplicate INI key: Carrying_Capacity");
+			}
+			else if (separator != string::npos && Satchel_ParseLimits(line.substr(separator + 1), limits))
+				globalLimits = limits;
+			else
+				Satchel_Log("Invalid INI limits: Carrying_Capacity");
+			globalSeen = true;
+			continue;
+		}
+		const uint32_t hash = separator == string::npos ? 0 : Satchel_ItemHash(key);
+		if (!hash)
+		{
+			Satchel_Log("Invalid INI key at line " + to_string(lineNumber));
+			continue;
+		}
+		if (!seen.insert(hash).second)
+		{
+			settings.erase(hash);
+			Satchel_Log("Duplicate INI item: " + key);
+			continue;
+		}
+		SatchelLimits limits;
+		if (!Satchel_ParseLimits(line.substr(separator + 1), limits))
+		{
+			Satchel_Log("Invalid INI limits: " + key);
+			continue;
+		}
+		settings.emplace(hash, SatchelSetting{key, limits, false});
+	}
+	if (in.bad()) return;
+	if (globalLimits.value[0]) settings.clear();
+	bool unchanged = Satchel_SameLimits(globalLimits, g_satchelGlobalLimits) &&
+		settings.size() == g_satchelSettings.size();
+	if (unchanged)
+	{
+		for (const auto &entry : settings)
+		{
+			const auto old = g_satchelSettings.find(entry.first);
+			if (old != g_satchelSettings.end() &&
+				Satchel_SameLimits(entry.second.limits, old->second.limits)) continue;
+			unchanged = false;
+			break;
+		}
+	}
+	if (unchanged)
+	{
+		if (!g_satchelScan && (Satchel_HasGlobalLimits() || !settings.empty()) &&
+			g_satchelSettings.size() == g_satchelRemaining && g_satchelGlobalResolved.empty())
+		{
+			g_satchelRetried = false;
+			g_satchelScanRequested = true;
+			g_satchelNextPoll = 0;
+		}
+		return;
+	}
+
+	g_satchelRetried = false;
+	g_satchelGlobalLimits = globalLimits;
+	g_satchelSettings.swap(settings);
+	g_satchelScanRequested = true;
+	g_satchelNextPoll = 0;
+}
+
+static int Satchel_RuleIndex(uint32_t tag)
+{
+	switch (tag)
+	{
+	case 0x409F50CB: return 0;
+	case 0xBE85CADE: case 0x12D8F0EC: case 0xD5C803CE:
+	case 0x0D7CB5AE: case 0x9F4FFF58: case 0xC7FE0AF5: return 1;
+	case 0x04718245: return 2;
+	default: return -1;
+	}
+}
+
+static bool Satchel_Decode(uintptr_t item, uint32_t hash, SatchelRecord &record)
+{
+	struct ArrayHeader { uintptr_t data; uint16_t count, capacity; };
+	ArrayHeader array = {};
+	uint32_t itemId = 0, descriptionId = 0;
+	unsigned char header[kSatchelRules - kSatchelItemId + sizeof(array)];
+	if (!Satchel_Read(item + kSatchelItemId, header, sizeof(header))) return false;
+	memcpy(&itemId, header, sizeof(itemId));
+	memcpy(&descriptionId, header + kSatchelItemDescriptionId - kSatchelItemId, sizeof(descriptionId));
+	memcpy(&array, header + kSatchelRules - kSatchelItemId, sizeof(array));
+	if (itemId != hash || descriptionId != hash || !array.data || (array.data & 7) ||
+		array.count < 3 || array.count > 32 || array.count > array.capacity)
+		return false;
+
+	uint64_t entries[32 * (kSatchelRuleSize / sizeof(uint64_t))];
+	if (!Satchel_Read(array.data, entries, array.count * kSatchelRuleSize)) return false;
+	record = SatchelRecord{};
+	record.item = item;
+	const auto bytes = reinterpret_cast<const uint8_t *>(entries);
+	for (size_t i = 0; i < array.count; ++i)
+	{
+		const size_t offset = i * kSatchelRuleSize;
+		uint32_t tag;
+		memcpy(&tag, bytes + offset + kSatchelRuleTag, sizeof(tag));
+		const int field = Satchel_RuleIndex(tag);
+		if (field < 0) continue;
+		if (record.fields[field]) return false;
+
+		int64_t value;
+		memcpy(&value, bytes + offset + kSatchelRuleValue, sizeof(value));
+		if (value < (field == 0 ? 1 : 0) || value > 2147483647) return false;
+		record.fields[field] = array.data + offset + kSatchelRuleValue;
+		record.limits.value[field] = value;
+	}
+	return record.fields[0] && record.fields[1] && record.fields[2] &&
+		record.limits.value[0] + record.limits.value[1] + record.limits.value[2] <= 2147483647;
+}
+
+static bool Satchel_SwapValue(uintptr_t address, int64_t current, int64_t desired)
+{
+	if (current == desired) return true;
+	MEMORY_BASIC_INFORMATION memory = {};
+	if (!VirtualQuery(reinterpret_cast<const void *>(address), &memory, sizeof(memory)) ||
+		memory.State != MEM_COMMIT || memory.Protect != PAGE_READWRITE)
+		return false;
+	__try
+	{
+		return InterlockedCompareExchange64(reinterpret_cast<volatile LONG64 *>(address),
+			desired, current) == current;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+static bool Satchel_Replace(const SatchelRecord &record, const SatchelLimits &next)
+{
+	for (size_t i = 0; i < 3; ++i)
+	{
+		if (Satchel_SwapValue(record.fields[i], record.limits.value[i], next.value[i])) continue;
+		while (i != 0)
+		{
+			--i;
+			Satchel_SwapValue(record.fields[i], next.value[i], record.limits.value[i]);
+		}
+		return false;
+	}
+	return true;
+}
+
+static void Satchel_RestoreLastEdit()
+{
+	const auto &edit = g_satchelEdits.back();
+	SatchelRecord live;
+	if (Satchel_Decode(edit.original.item, edit.hash, live) &&
+		memcmp(live.fields, edit.original.fields, sizeof(live.fields)) == 0 &&
+		Satchel_SameLimits(live.limits, edit.applied))
+		Satchel_Replace(live, edit.original.limits);
+	g_satchelEdits.pop_back();
+}
+
+static void Satchel_Restore()
+{
+	while (!g_satchelEdits.empty()) Satchel_RestoreLastEdit();
+}
+
+static int Satchel_ReadCapacity(uint32_t item, uint32_t slot)
+{
+	return static_cast<int>(ITEMS::_0xE80E50BEE276A54A(item, slot));
+}
+
+static unsigned Satchel_MatchingTiers(const SatchelLimits &values, int capacity)
+{
+	unsigned tiers = 0;
+	int64_t total = 0;
+	for (size_t tier = 0; tier < 3; ++tier)
+	{
+		total += values.value[tier];
+		if (total == capacity) tiers |= 1u << tier;
+	}
+	return tiers;
+}
+
+static int Satchel_Apply(uint32_t hash, const SatchelRecord &record, const SatchelLimits &limits)
+{
+	static const uint32_t slot = Joaat("SLOTID_SATCHEL");
+	const int before = Satchel_ReadCapacity(hash, slot);
+	const unsigned tiers = Satchel_MatchingTiers(record.limits, before);
+	if (before < 1 || !tiers) return 0;
+
+	const auto &wanted = limits.value;
+	const SatchelLimits next = {{wanted[0], wanted[1] - wanted[0], wanted[2] - wanted[1]}};
+	const bool unchanged = Satchel_SameLimits(record.limits, next);
+	if (unchanged && !Satchel_HasGlobalLimits()) return before;
+
+	if (tiers & Satchel_MatchingTiers(next, before))
+	{
+		const int64_t total = record.limits.value[0] + record.limits.value[1] + record.limits.value[2];
+		const int delta = total < 2147483647 ? 1 : -1;
+		const int64_t probe = record.limits.value[0] + delta;
+		if (probe < 1 || !Satchel_SwapValue(record.fields[0], record.limits.value[0], probe)) return 0;
+		const int afterProbe = Satchel_ReadCapacity(hash, slot);
+		if (!Satchel_SwapValue(record.fields[0], probe, record.limits.value[0]) ||
+			afterProbe != static_cast<int64_t>(before) + delta) return 0;
+	}
+
+	if (unchanged) return before;
+	if (!Satchel_Replace(record, next)) return 0;
+	const int after = Satchel_ReadCapacity(hash, slot);
+	if (!(tiers & Satchel_MatchingTiers(next, after)))
+	{
+		SatchelRecord applied = record;
+		applied.limits = next;
+		Satchel_Replace(applied, record.limits);
+		return 0;
+	}
+	g_satchelEdits.push_back(SatchelEdit{hash, record, next});
+	return after;
+}
+
+static LONG Satchel_AtomicRead(volatile LONG &value)
+{
+	return InterlockedCompareExchange(&value, 0, 0);
+}
+
+static void Satchel_ReleaseScan(SatchelScan *scan)
+{
+	if (InterlockedDecrement(&scan->references) == 0) delete scan;
+}
+
+static void Satchel_CancelScan()
+{
+	if (g_satchelScan) InterlockedExchange(&g_satchelScan->cancelled, 1);
+}
+
+static bool Satchel_ReapScan()
+{
+	if (!g_satchelScan) return true;
+	if (!Satchel_AtomicRead(g_satchelScan->done)) return false;
+	Satchel_ReleaseScan(g_satchelScan);
+	g_satchelScan = nullptr;
+	return true;
+}
+
+static bool Satchel_SendCandidate(SatchelScan &scan, SatchelCandidate candidate)
+{
+	const LONG tail = Satchel_AtomicRead(scan.tail);
+	const LONG next = (tail + 1) % kSatchelQueueSize;
+	while (next == Satchel_AtomicRead(scan.head))
+	{
+		if (Satchel_AtomicRead(scan.cancelled)) return false;
+		Sleep(1);
+	}
+	scan.queue[tail] = candidate;
+	InterlockedExchange(&scan.tail, next);
+	return true;
+}
+
+static bool Satchel_TakeCandidate(SatchelScan &scan, SatchelCandidate &candidate)
+{
+	const LONG head = Satchel_AtomicRead(scan.head);
+	if (head == Satchel_AtomicRead(scan.tail)) return false;
+	candidate = scan.queue[head];
+	InterlockedExchange(&scan.head, (head + 1) % kSatchelQueueSize);
+	return true;
+}
+
+static bool Satchel_DiscoverChunk(SatchelScan &scan, uintptr_t address, size_t size, size_t available)
+{
+	const size_t extra = available - size < kSatchelScanLookahead ? available - size : kSatchelScanLookahead;
+	const size_t bytes = size + extra;
+	if (!Satchel_Read(address, scan.buffer, bytes)) return true;
+	const size_t words = size / sizeof(uint64_t);
+	const size_t bufferedWords = bytes / sizeof(uint64_t);
+	constexpr size_t secondId = (kSatchelItemDescriptionId - kSatchelItemId) / sizeof(uint64_t);
+	constexpr size_t arrayPointer = (kSatchelRules - kSatchelItemId) / sizeof(uint64_t);
+	for (size_t i = 0; i < words; ++i)
+	{
+		const uint32_t hash = static_cast<uint32_t>(scan.buffer[i]);
+		if (!hash || (!scan.global && !scan.hashBuckets[hash & (kSatchelHashBuckets - 1)]) ||
+			(i + secondId < bufferedWords && hash != static_cast<uint32_t>(scan.buffer[i + secondId])))
+			continue;
+		if (i + arrayPointer + 1 < bufferedWords)
+		{
+			const uint64_t pointer = scan.buffer[i + arrayPointer];
+			const uint64_t header = scan.buffer[i + arrayPointer + 1];
+			const uint16_t count = static_cast<uint16_t>(header);
+			const uint16_t capacity = static_cast<uint16_t>(header >> 16);
+			if (pointer < 0x10000 || (pointer & 7) || count < 3 || count > 32 || count > capacity)
+				continue;
+		}
+
+		const uintptr_t item = address + i * sizeof(uint64_t) - kSatchelItemId;
+		SatchelRecord record;
+		if (Satchel_Decode(item, hash, record) && !Satchel_SendCandidate(scan, {item, hash})) return false;
+	}
+	return true;
+}
+
+static void Satchel_Discover(SatchelScan &scan)
+{
+	for (const auto &candidate : scan.cached)
+	{
+		if (Satchel_AtomicRead(scan.cancelled)) return;
+		SatchelRecord record;
+		if (Satchel_Decode(candidate.item, candidate.hash, record) &&
+			!Satchel_SendCandidate(scan, candidate)) return;
+	}
+
+	SYSTEM_INFO system = {};
+	GetSystemInfo(&system);
+	uintptr_t address = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
+	const uintptr_t scratch = reinterpret_cast<uintptr_t>(&scan);
+	const uintptr_t scratchEnd = scratch + sizeof(scan);
+	size_t bytesSinceYield = 0;
+	while (!Satchel_AtomicRead(scan.cancelled))
+	{
+		MEMORY_BASIC_INFORMATION memory = {};
+		if (!VirtualQuery(reinterpret_cast<const void *>(address), &memory, sizeof(memory))) return;
+		const uintptr_t end = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+		if (end <= address) return;
+		if (memory.State == MEM_COMMIT && (memory.Type == MEM_PRIVATE || memory.Type == MEM_MAPPED) &&
+			memory.Protect == PAGE_READWRITE)
+		{
+			while (address < end && !Satchel_AtomicRead(scan.cancelled))
+			{
+				if (address >= scratch && address < scratchEnd)
+				{
+					address = scratchEnd;
+					continue;
+				}
+				const uintptr_t readableEnd = address < scratch && scratch < end ? scratch : end;
+				const size_t available = readableEnd - address;
+				const size_t size = available < kSatchelScanSize ? available : kSatchelScanSize;
+				if (!Satchel_DiscoverChunk(scan, address, size, available)) return;
+				address += size;
+				bytesSinceYield += size;
+				if (bytesSinceYield >= 8 * 1024 * 1024)
+				{
+					Sleep(1);
+					bytesSinceYield = 0;
+				}
+			}
+		}
+		address = end;
+	}
+}
+
+static DWORD WINAPI Satchel_DiscoveryWorker(LPVOID context)
+{
+	auto *scan = static_cast<SatchelScan *>(context);
+	const HMODULE module = scan->module;
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+	Satchel_Discover(*scan);
+	InterlockedExchange(&scan->done, 1);
+	Satchel_ReleaseScan(scan);
+	FreeLibraryAndExitThread(module, 0);
+	return 0;
+}
+
+static void Satchel_StartScan()
+{
+	g_satchelScanRequested = false;
+	g_satchelRemaining = 0;
+	g_satchelGlobalResolved.clear();
+	g_satchelPendingTrim.clear();
+	if (!Satchel_HasGlobalLimits() && g_satchelSettings.empty()) return;
+	if (!Satchel_SupportedBuild())
+	{
+		Satchel_Log("Item catalogue layout not recognized.");
+		return;
+	}
+
+	auto *scan = new (std::nothrow) SatchelScan{};
+	if (!scan) return;
+	scan->global = Satchel_HasGlobalLimits();
+	scan->cached.reserve(g_satchelCachedItems.size());
+	for (const auto &entry : g_satchelCachedItems)
+	{
+		if (scan->global || g_satchelSettings.count(entry.first))
+			scan->cached.push_back({entry.second, entry.first});
+	}
+	for (auto &entry : g_satchelSettings)
+	{
+		entry.second.resolved = false;
+		scan->hashBuckets[entry.first & (kSatchelHashBuckets - 1)] = true;
+	}
+	g_satchelRemaining = g_satchelSettings.size();
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+		reinterpret_cast<LPCWSTR>(&Satchel_DiscoveryWorker), &scan->module))
+	{
+		delete scan;
+		return;
+	}
+	const HANDLE worker = CreateThread(nullptr, 0, Satchel_DiscoveryWorker, scan, 0, nullptr);
+	if (!worker)
+	{
+		FreeLibrary(scan->module);
+		delete scan;
+		Satchel_Log("Could not start item discovery.");
+		return;
+	}
+	CloseHandle(worker);
+	g_satchelScan = scan;
+}
+
+static bool Satchel_BudgetExpired(LONGLONG deadline)
+{
+	LARGE_INTEGER now = {};
+	return QueryPerformanceCounter(&now) && now.QuadPart >= deadline;
+}
+
+struct SatchelTrimInventory
+{
+	alignas(8) Any characterGuid[8] = {};
+	bool ready = false;
+};
+
+static constexpr int kSatchelStoryInventory = 1;
+
+static void Satchel_ReadTrimInventory(SatchelTrimInventory &inventory)
+{
+	if (ITEMS::_0x7C7E4AB748EA3B07()) return;
+	static const uint32_t character = Joaat("CHARACTER");
+	static const uint32_t rootSlot = Joaat("SLOTID_NONE");
+	alignas(8) Any emptyGuid[8] = {};
+	inventory.ready = ITEMS::_0x886DFD3E185C8A89(kSatchelStoryInventory, emptyGuid, character,
+		rootSlot, inventory.characterGuid) != 0;
+}
+
+static void Satchel_TrimExcess(uint32_t item, int capacity, SatchelTrimInventory &inventory)
+{
+	static const uint32_t slot = Joaat("SLOTID_SATCHEL");
+	static const uint32_t reason = Joaat("REMOVE_REASON_DEFAULT");
+	alignas(8) Any itemGuid[8] = {};
+	if (!ITEMS::_0x886DFD3E185C8A89(kSatchelStoryInventory,
+		inventory.characterGuid, item, slot, itemGuid) || !ITEMS::_0xB881CA836CC4B6D4(itemGuid))
+		return;
+
+	const int owned = invoke<int>(0xC97E0D2302382211ull, kSatchelStoryInventory, itemGuid, FALSE);
+	if (owned > capacity)
+		ITEMS::_0x3E4E811480B3AE79(kSatchelStoryInventory, itemGuid, owned - capacity, reason);
+}
+
+static void Satchel_TrimDeferred(const SatchelCandidate &candidate, SatchelTrimInventory &inventory)
+{
+	static const uint32_t slot = Joaat("SLOTID_SATCHEL");
+	const uint32_t item = candidate.hash;
+	SatchelRecord record;
+	if (!Satchel_Decode(candidate.item, item, record)) return;
+	const auto setting = g_satchelSettings.find(item);
+	if (setting == g_satchelSettings.end() && !Satchel_HasGlobalLimits()) return;
+	const auto &limits = setting != g_satchelSettings.end() ? setting->second.limits : g_satchelGlobalLimits;
+	const auto &wanted = limits.value;
+	const SatchelLimits expected = {{wanted[0], wanted[1] - wanted[0], wanted[2] - wanted[1]}};
+	if (!Satchel_SameLimits(record.limits, expected)) return;
+
+	const int capacity = Satchel_ReadCapacity(item, slot);
+	if (capacity > 0 && Satchel_MatchingTiers(expected, capacity))
+		Satchel_TrimExcess(item, capacity, inventory);
+}
+
+static void Satchel_ApplyCandidate(const SatchelCandidate &candidate, SatchelTrimInventory &inventory)
+{
+	const uint32_t hash = candidate.hash;
+	auto setting = g_satchelSettings.find(hash);
+	const bool specific = setting != g_satchelSettings.end();
+	if (specific ? setting->second.resolved : (!Satchel_HasGlobalLimits() || g_satchelGlobalResolved.count(hash)))
+		return;
+
+	SatchelRecord record;
+	if (!Satchel_Decode(candidate.item, hash, record)) return;
+	const auto &limits = specific ? setting->second.limits : g_satchelGlobalLimits;
+	const int capacity = Satchel_Apply(hash, record, limits);
+	if (!capacity) return;
+	g_satchelCachedItems[hash] = candidate.item;
+	if (inventory.ready)
+		Satchel_TrimExcess(hash, capacity, inventory);
+	else
+		g_satchelPendingTrim.push_back(candidate);
+	if (specific)
+	{
+		setting->second.resolved = true;
+		--g_satchelRemaining;
+	}
+	else
+		g_satchelGlobalResolved.insert(hash);
+}
+
+static void Satchel_Tick()
+{
+	const bool configured = Satchel_HasGlobalLimits() || !g_satchelSettings.empty();
+	if (!configured && !g_satchelScan && g_satchelEdits.empty() && !g_satchelScanRequested) return;
+
+	const ULONGLONG now = GetTickCount64();
+	if (now < g_satchelNextPoll) return;
+	if (NETWORK::NETWORK_IS_SESSION_ACTIVE() || NETWORK::NETWORK_IS_GAME_IN_PROGRESS())
+	{
+		Satchel_CancelScan();
+		Satchel_ReapScan();
+		Satchel_Restore();
+		g_satchelPendingTrim.clear();
+		g_satchelCachedItems.clear();
+		g_satchelWasPlaying = false;
+		g_satchelInactiveSince = 0;
+		g_satchelNextPoll = now + 250;
+		return;
+	}
+	if (DLC2::GET_IS_LOADING_SCREEN_ACTIVE())
+	{
+		Satchel_CancelScan();
+		Satchel_ReapScan();
+		g_satchelWasPlaying = false;
+		g_satchelInactiveSince = 0;
+		g_satchelNextPoll = now + 100;
+		return;
+	}
+	if (!PLAYER::IS_PLAYER_PLAYING(PLAYER::PLAYER_ID()) && !StableShopUiActive())
+	{
+		g_satchelNextPoll = now + 250;
+		if (!g_satchelWasPlaying || UI::IS_PAUSE_MENU_ACTIVE())
+			g_satchelInactiveSince = 0;
+		else if (!g_satchelInactiveSince)
+			g_satchelInactiveSince = now;
+		else if (now - g_satchelInactiveSince >= 2000)
+		{
+			Satchel_CancelScan();
+			Satchel_ReapScan();
+			g_satchelWasPlaying = false;
+		}
+		return;
+	}
+	g_satchelInactiveSince = 0;
+
+	if (g_satchelWasPlaying && !g_satchelScanRequested && !g_satchelScan && g_satchelPendingTrim.empty())
+	{
+		g_satchelNextPoll = now + 250;
+		return;
+	}
+	static const LONGLONG budget = []() -> LONGLONG
+	{
+		LARGE_INTEGER frequency = {};
+		return QueryPerformanceFrequency(&frequency) ? frequency.QuadPart / 2000 : 0;
+	}();
+	LARGE_INTEGER start = {};
+	QueryPerformanceCounter(&start);
+	const LONGLONG deadline = start.QuadPart + budget;
+
+	if (!g_satchelWasPlaying || g_satchelScanRequested)
+	{
+		Satchel_CancelScan();
+		if (!Satchel_ReapScan()) return;
+		unsigned restored = 0;
+		while (!g_satchelEdits.empty())
+		{
+			Satchel_RestoreLastEdit();
+			if (++restored == 32 || Satchel_BudgetExpired(deadline)) return;
+		}
+		g_satchelWasPlaying = true;
+		Satchel_StartScan();
+	}
+	SatchelTrimInventory inventory;
+	if (g_satchelScan || !g_satchelPendingTrim.empty()) Satchel_ReadTrimInventory(inventory);
+	if (!g_satchelPendingTrim.empty() && inventory.ready)
+	{
+		for (unsigned i = 0; i < 8 && !g_satchelPendingTrim.empty(); ++i)
+		{
+			Satchel_TrimDeferred(g_satchelPendingTrim.back(), inventory);
+			g_satchelPendingTrim.pop_back();
+			if (Satchel_BudgetExpired(deadline)) return;
+		}
+	}
+	if (!g_satchelScan)
+	{
+		if (g_satchelPendingTrim.empty() || !inventory.ready)
+			g_satchelNextPoll = now + 250;
+		return;
+	}
+
+	auto &scan = *g_satchelScan;
+	SatchelCandidate candidate;
+	unsigned processed = 0;
+	while ((scan.global || g_satchelRemaining) && processed < 16 && Satchel_TakeCandidate(scan, candidate))
+	{
+		Satchel_ApplyCandidate(candidate, inventory);
+		++processed;
+		if (Satchel_BudgetExpired(deadline)) break;
+	}
+
+	if (!scan.global && !g_satchelRemaining) Satchel_CancelScan();
+	if (!Satchel_AtomicRead(scan.done) ||
+		((scan.global || g_satchelRemaining) && Satchel_AtomicRead(scan.head) != Satchel_AtomicRead(scan.tail)))
+		return;
+
+	Satchel_ReapScan();
+	g_satchelNextPoll = now + 250;
+	const size_t verified = g_satchelSettings.size() - g_satchelRemaining + g_satchelGlobalResolved.size();
+	if (!verified && !g_satchelRetried)
+	{
+		g_satchelRetried = true;
+		g_satchelScanRequested = true;
+		g_satchelNextPoll = now + 2000;
+	}
+	Satchel_Log("Items verified: " + to_string(verified) +
+		"; items modified: " + to_string(g_satchelEdits.size()) +
+		"; configured items not verified: " + to_string(g_satchelRemaining));
+}
+
 static void LoadConfig()
 {
 	string iniPath = GetIniPath();
+	Satchel_LoadConfig(iniPath);
 
 	if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
 		return;
@@ -1100,7 +1835,7 @@ static void LoadConfig()
 				for (auto &c : lower) c = (char)tolower((unsigned char)c);
 				if (lower == "male") entry.gender = 1;
 				else if (lower == "female") entry.gender = 0;
-				else if (lower == "unknown") entry.gender = -2; // random gender
+				else if (lower == "unknown") entry.gender = -2;
 
 				int multiplier = 1;
 				size_t starPos = rawPrice.find('*');
@@ -1405,7 +2140,7 @@ static void LoadConfig()
 					else if (lower == "female")
 						entry.gender = 0;
 					else if (lower == "unknown")
-						entry.gender = -2; // random gender
+						entry.gender = -2;
 				}
 			}
 			g_startSpawns.push_back(entry);
@@ -1608,7 +2343,6 @@ struct MenuInputButtonState
 	bool a, b, up, down, l, r;
 };
 
-/* configurable key bindings loaded from ini */
 extern int g_menuToggle;
 extern int g_selectKey;
 extern int g_backKey;
@@ -2672,16 +3406,16 @@ void main()
 			{
 				struct SpecialKey { int vk; char normal; char shifted; };
 					static const SpecialKey specialKeys[] = {
-						{0xBF, '?', '/'},  // OEM_2
-						{0xDE, '\'', '"'}, // OEM_7
-						{0xBC, ',', '<'},  // OEM_COMMA
-						{0xBE, '.', '>'},  // OEM_PERIOD
-						{0xBD, '-', '_'},  // OEM_MINUS
-						{0xBA, ';', ':'},  // OEM_1
-						{0xC0, '`', '~'},  // OEM_3
-						{0xDB, '[', '{'},  // OEM_4
-						{0xDD, ']', '}'},  // OEM_5
-						{0xDC, '\\', '|'}, // OEM_102
+						{0xBF, '?', '/'},
+						{0xDE, '\'', '"'},
+						{0xBC, ',', '<'},
+						{0xBE, '.', '>'},
+						{0xBD, '-', '_'},
+						{0xBA, ';', ':'},
+						{0xC0, '`', '~'},
+						{0xDB, '[', '{'},
+						{0xDD, ']', '}'},
+						{0xDC, '\\', '|'},
 					};
 					for (const auto &sk : specialKeys)
 					{
@@ -3034,7 +3768,6 @@ void main()
 							if (shopItemHash != 0)
 								compHashes[compCount++] = (DWORD)shopItemHash;
 						}
-
 					}
 				}
 
@@ -3303,6 +4036,7 @@ void main()
 
 		BlanketRemover_Tick();
 		StoryHorseRename_Tick();
+		Satchel_Tick();
 
 		WAIT(0);
 	}
@@ -4220,19 +4954,25 @@ void SniperHook_Shutdown()
 static const int kArrayHeader = 40 + 1095 + 1;
 static const int kStride      = 436;
 static const int kSlots       = 7;
+static const int kHorsePedArray = 1900383;
+static const int kHorsePedStride = 45;
 static const int kFBreed      = 8;
 static const int kFModel      = 9;
+static const int kFGender     = 10;
 static const int kFState      = 14;
 static inline int GIdx(int slot, int field) { return kArrayHeader + 1 + slot * kStride + field; }
 
 static bool   g_enabled = false;
 
+static bool ReadScriptValue(const volatile uint64_t *p, uint64_t &out)
+{
+	if (!p) return false;
+	__try { out = *p; } __except (1) { return false; }
+	return true;
+}
 static bool RdG64(int idx, uint64_t &out)
 {
-	UINT64 *p = getGlobalPtr(idx);
-	if (!p) return false;
-	__try { out = *(volatile uint64_t *)p; } __except (1) { return false; }
-	return true;
+	return ReadScriptValue(getGlobalPtr(idx), out);
 }
 static bool RdG(int idx, uint32_t &out)
 {
@@ -4249,13 +4989,14 @@ static bool WrG(int idx, uint32_t v)
 	return true;
 }
 
-struct SlotInfo { bool ok; uint32_t state, breed, model; };
+struct SlotInfo { bool ok; uint32_t state, breed, model, gender; };
 static SlotInfo ReadSlot(int slot)
 {
-	SlotInfo s = { false, 0, 0, 0 };
+	SlotInfo s = {};
 	if (!RdG(GIdx(slot, kFState), s.state)) return s;
 	if (!RdG(GIdx(slot, kFBreed), s.breed)) return s;
 	if (!RdG(GIdx(slot, kFModel), s.model)) return s;
+	if (!RdG(GIdx(slot, kFGender), s.gender)) return s;
 	s.ok = true;
 	return s;
 }
@@ -4283,7 +5024,6 @@ static const char *kOnlineModels[] = {
 	"A_C_HORSE_AMERICANSTANDARDBRED_LIGHTBUCKSKIN",
 	"A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE",
 	"A_C_HORSE_ARABIAN_GREY",
-	"A_C_HORSE_ARDENNES_IRONGREYROAN",
 	"A_C_HORSE_BRETON_GRULLODUN",
 	"A_C_HORSE_BRETON_MEALYDAPPLEBAY",
 	"A_C_HORSE_BRETON_REDROAN",
@@ -4326,7 +5066,6 @@ static const char *kOnlineModels[] = {
 	"A_C_HORSE_NORFOLKROADSTER_SPECKLEDGREY",
 	"A_C_HORSE_NORFOLKROADSTER_SPOTTEDTRICOLOR",
 	"A_C_HORSE_THOROUGHBRED_BLACKCHESTNUT",
-	"A_C_HORSE_THOROUGHBRED_REVERSEDAPPLEBLACK",
 	"A_C_HORSE_TURKOMAN_BLACK",
 	"A_C_HORSE_TURKOMAN_CHESTNUT",
 	"A_C_HORSE_TURKOMAN_GREY",
@@ -4366,18 +5105,6 @@ static const OnlineModel *FindOnline(uint32_t model)
 
 struct MapEntry { bool valid; uint32_t realBreed, realModel; int ownerSlot; };
 static MapEntry g_map[F_COUNT];
-
-static DWORD ResolveApocalypseHorseModel(DWORD visibleModel)
-{
-	if (FindOnline(visibleModel)) return visibleModel;
-	for (int d = 0; d < 3; d++)
-	{
-		if (kDonors[d].model != visibleModel) continue;
-		if (g_map[d].valid && FindOnline(g_map[d].realModel))
-			return g_map[d].realModel;
-	}
-	return visibleModel;
-}
 
 static int DonorOfPair(uint32_t breed, uint32_t model);
 
@@ -4681,7 +5408,6 @@ static void RetireDonorActiveHorse()
 }
 
 static Ped SlotPed(int slot);
-static void DiscoverEntField(const int *validPeds, int nValid);
 
 static void RetireMappedDonorPedsImpl()
 {
@@ -4689,23 +5415,6 @@ static void RetireMappedDonorPedsImpl()
 	DWORD now = GetTickCount();
 	if (now < nextCheck || g_donorMode) return;
 	nextCheck = now + 250;
-
-	int nearby[32 + 1]; nearby[0] = 32;
-	int count = PED::GET_PED_NEARBY_PEDS(PLAYER::PLAYER_PED_ID(), nearby, -1, -1);
-	if (count < 0) count = 0;
-	if (count > 32) count = 32;
-	int validPeds[32]; int validCount = 0;
-	for (int n = 0; n < count; n++)
-	{
-		Ped ped = (Ped)nearby[n + 1];
-		if (!ped || !ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped)) continue;
-		uint32_t model = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
-		bool isDonorModel = false;
-		for (int d = 0; d < F_COUNT; d++) if (kDonors[d].model == model) { isDonorModel = true; break; }
-		if (isDonorModel) validPeds[validCount++] = (int)ped;
-	}
-	if (validCount <= 0) return;
-	DiscoverEntField(validPeds, validCount);
 
 	Ped player = PLAYER::PLAYER_PED_ID();
 	for (int slot = 0; slot < kSlots; slot++)
@@ -4753,7 +5462,6 @@ static const HudCoat kCoats[] = {
 	{ "A_C_HORSE_AMERICANSTANDARDBRED_LIGHTBUCKSKIN", "COAT_LIGHTBUCKSKIN" },
 	{ "A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE", "COAT_BLACKSNO" },
 	{ "A_C_HORSE_ARABIAN_GREY", "COAT_GREY" },
-	{ "A_C_HORSE_ARDENNES_IRONGREYROAN", "COAT_IRONGREYR" },
 	{ "A_C_HORSE_BRETON_GRULLODUN", "COAT_GRULDUN" },
 	{ "A_C_HORSE_BRETON_MEALYDAPPLEBAY", "COAT_MEALYDAPBAY" },
 	{ "A_C_HORSE_BRETON_REDROAN", "COAT_REDR" },
@@ -4796,7 +5504,6 @@ static const HudCoat kCoats[] = {
 	{ "A_C_HORSE_NORFOLKROADSTER_SPECKLEDGREY", "COAT_SPECKLEDGREY" },
 	{ "A_C_HORSE_NORFOLKROADSTER_SPOTTEDTRICOLOR", "COAT_SPOTTEDTRICOLOR" },
 	{ "A_C_HORSE_THOROUGHBRED_BLACKCHESTNUT", "COAT_BLACKCH" },
-	{ "A_C_HORSE_THOROUGHBRED_REVERSEDAPPLEBLACK", "COAT_REVDAPBLACK" },
 	{ "A_C_HORSE_TURKOMAN_BLACK", "COAT_BLACK" },
 	{ "A_C_HORSE_TURKOMAN_CHESTNUT", "COAT_CH" },
 	{ "A_C_HORSE_TURKOMAN_GREY", "COAT_GREY" },
@@ -4813,7 +5520,6 @@ static const HorseStat kStats[] = {
 	{ "A_C_HORSE_AMERICANSTANDARDBRED_LIGHTBUCKSKIN", 4, 4, 5, 4, "HORSE_CLASS_RACE" },
 	{ "A_C_HORSE_APPALOOSA_BLACKSNOWFLAKE", 4, 5, 4, 4, "HORSE_CLASS_WORK" },
 	{ "A_C_HORSE_ARABIAN_GREY", 5, 5, 6, 6, "HORSE_CLASS_SUPERIOR" },
-	{ "A_C_HORSE_ARDENNES_IRONGREYROAN", 7, 5, 3, 3, "HORSE_CLASS_WAR" },
 	{ "A_C_HORSE_BRETON_GRULLODUN", 5, 6, 5, 3, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_BRETON_MEALYDAPPLEBAY", 6, 7, 6, 4, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_BRETON_REDROAN", 4, 5, 4, 2, "HORSE_CLASS_MULTI" },
@@ -4856,7 +5562,6 @@ static const HorseStat kStats[] = {
 	{ "A_C_HORSE_NORFOLKROADSTER_SPECKLEDGREY", 2, 4, 5, 4, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_NORFOLKROADSTER_SPOTTEDTRICOLOR", 4, 6, 7, 6, "HORSE_CLASS_MULTI" },
 	{ "A_C_HORSE_THOROUGHBRED_BLACKCHESTNUT", 3, 3, 7, 5, "HORSE_CLASS_RACE" },
-	{ "A_C_HORSE_THOROUGHBRED_REVERSEDAPPLEBLACK", 3, 3, 7, 5, "HORSE_CLASS_RACE" },
 	{ "A_C_HORSE_TURKOMAN_BLACK", 7, 5, 6, 5, "HORSE_CLASS_RACEWAR" },
 	{ "A_C_HORSE_TURKOMAN_CHESTNUT", 7, 5, 6, 5, "HORSE_CLASS_RACEWAR" },
 	{ "A_C_HORSE_TURKOMAN_GREY", 7, 5, 6, 5, "HORSE_CLASS_RACEWAR" },
@@ -4874,6 +5579,7 @@ static const char *TypeLabelFor(const OnlineModel &om)
 }
 
 static BOOL DbValid(Any e) { return e ? invoke<BOOL>(0x1E7130793AAAAB8Dull, e) : FALSE; }
+static int DbReadInt(Any c, const char *key) { return invoke<int>(0xFFC566A4801F6B40ull, c, key); }
 static uint32_t DbReadHash(Any c, const char *key) { return (uint32_t)invoke<Any>(0x9B535990B01B62DEull, c, key); }
 
 static Any FindSceneContainer()
@@ -4900,13 +5606,14 @@ static Any FindSceneContainer()
 	return guess;
 }
 
-static int g_entField = -1;
 static Ped SlotPed(int slot)
 {
-	if (g_entField < 0) return 0;
-	uint32_t v = 0;
-	if (!RdG(GIdx(slot, g_entField), v) || v == 0 || v > 0x7FFFFFFFu) return 0;
-	return (Ped)v;
+	if (slot < 0 || slot >= kSlots) return 0;
+	uint32_t count = 0;
+	uint32_t ped = 0;
+	if (!RdG(kHorsePedArray, count) || count != kSlots ||
+		!RdG(kHorsePedArray + 1 + slot * kHorsePedStride, ped) || ped > 0x7FFFFFFFu) return 0;
+	return (Ped)ped;
 }
 
 static string TrimNickname(const string &s)
@@ -4921,127 +5628,71 @@ static vector<Ped> g_ownedHorsePeds;
 static void NoteOwnedHorse(Ped ped)
 {
 	if (ped == 0) return;
-	for (size_t i = 0; i < g_ownedHorsePeds.size(); i++)
-		if (g_ownedHorsePeds[i] == ped) return;
-	if (ENTITY::DOES_ENTITY_EXIST(ped)) g_ownedHorsePeds.push_back(ped);
-}
-static bool IsOwnedByPlayer(Ped horse)
-{
-	if (horse == 0 || !ENTITY::DOES_ENTITY_EXIST(horse)) return false;
-	if (g_saddleHorse != 0 && horse == g_saddleHorse) return true;
-	Ped playerPed = PLAYER::PLAYER_PED_ID();
-	if (ENTITY::DOES_ENTITY_EXIST(playerPed) && PED::GET_MOUNT(playerPed) == horse) return true;
+	bool tracked = false;
 	for (size_t i = 0; i < g_ownedHorsePeds.size();)
 	{
-		if (!ENTITY::DOES_ENTITY_EXIST(g_ownedHorsePeds[i]) || ENTITY::IS_ENTITY_DEAD(g_ownedHorsePeds[i]))
-		{
+		Ped owned = g_ownedHorsePeds[i];
+		if (!ENTITY::DOES_ENTITY_EXIST(owned) || ENTITY::IS_ENTITY_DEAD(owned))
 			g_ownedHorsePeds.erase(g_ownedHorsePeds.begin() + i);
-			continue;
-		}
-		if (g_ownedHorsePeds[i] == horse) return true;
-		++i;
-	}
-	return false;
-}
-static bool SlotNicknameMatches(int slot, const ApocalypseHorseEntry &entry)
-{
-	string name = TrimNickname(ReadName(slot));
-	if (name.empty()) return false;
-	for (size_t j = 0; j < entry.requiredNames.size(); j++)
-		if (SameName(name, TrimNickname(entry.requiredNames[j]))) return true;
-	return false;
-}
-static bool PedNicknameMatches(const ApocalypseHorseEntry &entry, Ped horse)
-{
-	if (!entry.HasRequiredNames()) return true;
-	for (int i = 0; i < kSlots; i++)
-	{
-		SlotInfo s = ReadSlot(i);
-		if (s.ok && s.state != 0 && SlotPed(i) == horse) return SlotNicknameMatches(i, entry);
-	}
-	if (!IsOwnedByPlayer(horse)) return false;
-	DWORD m = ENTITY::GET_ENTITY_MODEL(horse);
-	for (int i = 0; i < kSlots; i++)
-	{
-		SlotInfo s = ReadSlot(i);
-		if (!s.ok || s.state == 0) continue;
-		bool match = (s.model == m);
-		if (!match)
+		else
 		{
-			int d = DonorOfPair(s.breed, s.model);
-			if (d >= 0 && g_map[d].valid && g_map[d].realModel == m) match = true;
+			if (owned == ped) tracked = true;
+			i++;
 		}
-		if (!match) continue;
-		if (SlotNicknameMatches(i, entry)) return true;
 	}
-	return false;
+	if (!tracked && ENTITY::DOES_ENTITY_EXIST(ped)) g_ownedHorsePeds.push_back(ped);
 }
-static bool PedNicknameMatchesInShop(const ApocalypseHorseEntry &entry, Ped horse)
+static const ApocalypseHorseEntry *FindApocalypseHorse(Ped horse, DWORD *resolvedModel)
 {
-	if (!entry.HasRequiredNames()) return true;
-	if (g_shopShownSlot >= 0 && horse == g_shopShownPed) return SlotNicknameMatches(g_shopShownSlot, entry);
-	for (int i = 0; i < kSlots; i++)
-	{
-		SlotInfo s = ReadSlot(i);
-		if (s.ok && s.state != 0 && SlotPed(i) == horse) return SlotNicknameMatches(i, entry);
-	}
-	DWORD m = ENTITY::GET_ENTITY_MODEL(horse);
-	for (int i = 0; i < kSlots; i++)
-	{
-		SlotInfo s = ReadSlot(i);
-		if (!s.ok || s.state == 0) continue;
-		bool match = (s.model == m);
-		if (!match)
-		{
-			int d = DonorOfPair(s.breed, s.model);
-			if (d >= 0 && g_map[d].valid && g_map[d].realModel == m) match = true;
-		}
-		if (match && SlotNicknameMatches(i, entry)) return true;
-	}
-	return false;
-}
-static void DiscoverEntField(const int *validPeds, int nValid)
-{
-	static DWORD lastTry = 0; static int tries = 0;
-	DWORD now = GetTickCount();
-	if (g_entField >= 0 || tries >= 15 || now - lastTry < 2000 || nValid <= 0) return;
-	lastTry = now; tries++;
-	int bestF = -1, bestHits = 0;
-	for (int f = 0; f < kStride; f++)
-	{
-		int hits = 0;
-		for (int sl = 0; sl < kSlots; sl++)
-		{
-			SlotInfo si = ReadSlot(sl);
-			if (!si.ok || si.state == 0) continue;
-			uint32_t v = 0;
-			if (!RdG(GIdx(sl, f), v) || v == 0) continue;
-			for (int k = 0; k < nValid; k++)
-			{
-				if ((uint32_t)validPeds[k] != v) continue;
-				uint32_t pm = (uint32_t)ENTITY::GET_ENTITY_MODEL((Ped)v);
-				int d = DonorOfPair(si.breed, si.model);
-				bool mappedRuntime = false;
-				for (int md = 0; md < F_COUNT; md++)
-				{
-					if (!g_map[md].valid || g_map[md].realModel != si.model) continue;
-					if (g_map[md].realBreed != 0 && si.breed != 0 && g_map[md].realBreed != si.breed) continue;
-					if (pm == kDonors[md].model) { mappedRuntime = true; break; }
-				}
-				if (pm == si.model || (d >= 0 && pm == kDonors[d].model) || (d >= 0 && g_map[d].valid && pm == g_map[d].realModel) || mappedRuntime) hits++;
-				break;
-			}
-		}
-		if (hits > bestHits) { bestHits = hits; bestF = f; }
-	}
-	if (bestF >= 0) g_entField = bestF;
-}
+	if (g_apocalypseHorses.empty() || horse == 0 ||
+		!ENTITY::DOES_ENTITY_EXIST(horse) || ENTITY::IS_ENTITY_DEAD(horse)) return nullptr;
 
-static bool IsKnownHorseModel(uint32_t pm)
+	int slot = -1;
+	SlotInfo horseSlot = {};
+	for (int i = 0; i < kSlots; i++)
+	{
+		if (SlotPed(i) != horse) continue;
+		SlotInfo info = ReadSlot(i);
+		if (!info.ok || info.state == 0 || info.breed == 0 || info.model == 0) continue;
+		if (slot >= 0) return nullptr;
+		slot = i;
+		horseSlot = info;
+	}
+
+	if (slot < 0) return nullptr;
+
+	const DWORD visibleModel = ENTITY::GET_ENTITY_MODEL(horse);
+	DWORD realModel = horseSlot.model;
+	const int donor = DonorOfPair(horseSlot.breed, horseSlot.model);
+	if (donor >= 0 && g_map[donor].valid && g_map[donor].ownerSlot == slot)
+		realModel = g_map[donor].realModel;
+	if (visibleModel != horseSlot.model && visibleModel != realModel) return nullptr;
+	if (resolvedModel) *resolvedModel = realModel;
+	if (horseSlot.gender != 1) return nullptr;
+
+	for (const ApocalypseHorseEntry &entry : g_apocalypseHorses)
+	{
+		if (!entry.MatchesModel(realModel)) continue;
+		const string nickname = TrimNickname(ReadName(slot));
+		for (const string &requiredName : entry.requiredNames)
+		{
+			if (!SameName(nickname, requiredName)) continue;
+			return &entry;
+		}
+	}
+	return nullptr;
+}
+static int GetSelectedStableSlot()
 {
-	if (FindOnline(pm)) return true;
-	for (int d = 0; d < F_COUNT; d++) if (kDonors[d].model == pm) return true;
-	return false;
+	static const int kSelectedShopEntry = 1914319 + 16855 + 3 + 10;
+	uint32_t entry = 0;
+	if (!RdG(kSelectedShopEntry, entry) || !DbValid(entry)) return -1;
+
+	static const uint32_t stableSlot = Joaat("GSUI_STABLE_SLOT");
+	if ((uint32_t)DbReadInt(entry, "uiItemType") != stableSlot) return -1;
+
+	int slot = DbReadInt(entry, "uiItemID");
+	return slot >= 0 && slot < kSlots ? slot : -1;
 }
 
 static bool DonorHeld(int d)
@@ -5055,28 +5706,6 @@ static bool DonorHeld(int d)
 	return false;
 }
 
-static const OnlineModel *HudIdentity(Ped ped, uint32_t pedModel, int &slotOut, const char *&how)
-{
-	slotOut = -1; how = "none";
-	for (int s = 0; s < kSlots; s++)
-	{
-		if (SlotPed(s) != ped) continue;
-		SlotInfo si = ReadSlot(s);
-		if (!si.ok || si.state == 0) break;
-		slotOut = s;
-		int d = DonorOfPair(si.breed, si.model);
-		if (d >= 0 && g_map[d].valid && DonorHeld(d)) { const OnlineModel *m = FindOnline(g_map[d].realModel); if (m) { how = "slot+donorMap"; return m; } }
-		const OnlineModel *m = FindOnline(si.model);
-		if (m) { how = "slot+realModel"; return m; }
-		break;
-	}
-	const OnlineModel *m = FindOnline(pedModel);
-	if (m) { how = "pedModel"; return m; }
-	for (int dd = 0; dd < F_COUNT; dd++)
-		if (kDonors[dd].model == pedModel && g_map[dd].valid && DonorHeld(dd)) { m = FindOnline(g_map[dd].realModel); if (m) { how = "donorModelMap"; return m; } }
-	return nullptr;
-}
-
 static bool g_worldPedsBroken = false;
 static int SafeWorldGetAllPeds(int *arr, int n)
 {
@@ -5085,171 +5714,38 @@ static int SafeWorldGetAllPeds(int *arr, int n)
 	__except (EXCEPTION_EXECUTE_HANDLER) { g_worldPedsBroken = true; return 0; }
 }
 
-static void HudClearOurs(Any cont, bool &haveOurs)
-{
-	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseType", (Hash)0);
-	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseBreed", (Hash)0xE86CEE40);
-	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseCoat", (Hash)0);
-	haveOurs = false;
-}
-
-static int HudMissingStableSlot(const uint32_t *pedModels, int np, const OnlineModel **omOut)
-{
-	bool used[96] = {};
-	int missing = -1, nMissing = 0;
-	for (int i = 1; i <= 5 && i < kSlots; i++)
-	{
-		SlotInfo s = ReadSlot(i);
-		if (!s.ok || s.state == 0) continue;
-		uint32_t real = 0, donor = 0;
-		const OnlineModel *m = nullptr;
-		int d = DonorOfPair(s.breed, s.model);
-		if (d >= 0 && g_map[d].valid && DonorHeld(d)) { real = g_map[d].realModel; donor = kDonors[d].model; m = FindOnline(real); }
-		else if ((m = FindOnline(s.model)) != nullptr) { real = s.model; }
-		if (!m) continue;
-		bool matched = false;
-		for (int k = 0; k < np && k < 96; k++)
-			if (!used[k] && (pedModels[k] == real || (donor && pedModels[k] == donor))) { used[k] = true; matched = true; break; }
-		if (!matched) { missing = i; nMissing++; *omOut = m; }
-	}
-	return nMissing == 1 ? missing : -1;
-}
-
 static void ApplyStableHud(bool inMenu)
 {
-	static Ped candPed = 0; static int candCount = 0; static Vector3 prevCam;
-	static bool haveOurs = false; static uint32_t oursType = 0, oursBreed = 0, oursCoat = 0;
-	if (!g_hud || !inMenu) { candPed = 0; candCount = 0; g_shopShownPed = 0; g_shopShownSlot = -1; return; }
-	static DWORD last = 0;
-	DWORD now = GetTickCount();
-	if (now - last < 150) return;
-	last = now;
+	if (!inMenu) return;
 
-	Any cont = FindSceneContainer();
-	if (!cont) return;
+	const int slot = GetSelectedStableSlot();
+	if (slot < 0) return;
 
-	uint32_t curType  = DbReadHash(cont, "HorseType");
-	uint32_t curBreed = DbReadHash(cont, "HorseBreed");
-	uint32_t curCoat  = DbReadHash(cont, "HorseCoat");
+	const SlotInfo horse = ReadSlot(slot);
+	if (!horse.ok || horse.state == 0) return;
 
-	Vector3 ref = ENTITY::GET_ENTITY_COORDS(PLAYER::PLAYER_PED_ID(), TRUE, TRUE);
-	Cam cam = CAM::GET_RENDERING_CAM();
-	if (cam) { Vector3 cp = CAM::GET_CAM_COORD(cam); if (cp.x != 0.0f || cp.y != 0.0f || cp.z != 0.0f) ref = cp; }
-	const float camMoved = sqrtf((ref.x - prevCam.x) * (ref.x - prevCam.x) + (ref.y - prevCam.y) * (ref.y - prevCam.y) + (ref.z - prevCam.z) * (ref.z - prevCam.z));
-	prevCam = ref;
+	uint32_t model = horse.model;
+	const int donor = DonorOfPair(horse.breed, horse.model);
+	if (donor >= 0 && g_map[donor].valid && g_map[donor].ownerSlot == slot)
+		model = g_map[donor].realModel;
 
-	static const float kFocusX = 0.62f, kFocusY = 0.55f;
-	struct HudCand { Ped ped; uint32_t model; float sx, sy, dist, score; bool onScreen, visible; };
-	HudCand cands[64]; int nc = 0;
-	int peds[32 + 1]; peds[0] = 32;
-	int count = PED::GET_PED_NEARBY_PEDS(PLAYER::PLAYER_PED_ID(), peds, -1, -1);
-	Ped player = PLAYER::PLAYER_PED_ID();
-	int pedList[300]; int np = 0;
-	for (int i = 0; i < count && i < 32 && np < 300; i++) pedList[np++] = peds[i + 1];
-	{
-		int world[256];
-		int nw = SafeWorldGetAllPeds(world, 256);
-		for (int i = 0; i < nw && i < 256 && np < 300; i++)
-		{
-			bool dup = false;
-			for (int k = 0; k < np; k++) if (pedList[k] == world[i]) { dup = true; break; }
-			if (!dup) pedList[np++] = world[i];
-		}
-	}
-	for (int i = 0; i < np && nc < 64; i++)
-	{
-		Ped ped = (Ped)pedList[i];
-		if (ped == player || !ENTITY::DOES_ENTITY_EXIST(ped)) continue;
-		uint32_t pm = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
-		if (!IsKnownHorseModel(pm) && !invoke<BOOL>(0x772A1969F649E902ull, (Hash)pm)) continue;
-		Vector3 p = ENTITY::GET_ENTITY_COORDS(ped, TRUE, TRUE);
-		float d2 = (p.x - ref.x) * (p.x - ref.x) + (p.y - ref.y) * (p.y - ref.y) + (p.z - ref.z) * (p.z - ref.z);
-		if (d2 > 30.0f * 30.0f) continue;
-		HudCand &c = cands[nc++];
-		c.ped = ped; c.model = pm; c.dist = sqrtf(d2); c.sx = 0.0f; c.sy = 0.0f;
-		c.onScreen = false;
-		{
-			static const float kProbe[3] = { 0.3f, 1.0f, -0.4f };
-			for (int k = 0; k < 3 && !c.onScreen; k++)
-			{
-				float sx = 0.0f, sy = 0.0f;
-				if (GRAPHICS::GET_SCREEN_COORD_FROM_WORLD_COORD(p.x, p.y, p.z + kProbe[k], &sx, &sy)) { c.onScreen = true; c.sx = sx; c.sy = sy; }
-			}
-		}
-		c.visible  = ENTITY::IS_ENTITY_VISIBLE(ped) != 0;
-		float dx = c.sx - kFocusX, dy = c.sy - kFocusY;
-		c.score = dx * dx + dy * dy + 0.0005f * c.dist + (c.visible ? 0.0f : 1.0f);
-	}
-	{
-		int vp[64];
-		for (int i = 0; i < nc; i++) vp[i] = (int)cands[i].ped;
-		DiscoverEntField(vp, nc);
-	}
-	static const uint32_t kBlankBreed = 0xE86CEE40;
-	const bool holdsOurs = haveOurs && curType == oursType && curBreed == oursBreed && curCoat == oursCoat;
+	const OnlineModel *online = FindOnline(model);
+	if (!online) return;
 
-	int best = -1;
-	for (int i = 0; i < nc; i++)
-		if (cands[i].onScreen && (best < 0 || cands[i].score < cands[best].score)) best = i;
+	const Any scene = FindSceneContainer();
+	if (!scene) return;
 
-	const bool focusOk = best >= 0 && cands[best].score < 0.12f;
+	const char *coatLabel = CoatLabelFor(online->name);
+	const char *const fields[] = { "HorseType", "HorseBreed", "HorseCoat" };
+	const Hash values[] = {
+		Joaat(TypeLabelFor(*online)),
+		Joaat(BreedKey(online->name).c_str()),
+		coatLabel ? Joaat(coatLabel) : 0,
+	};
 
-	Ped shown = 0; int slot = -1; const char *how = "none";
-	const OnlineModel *om = nullptr;
-	uint32_t shownModel = 0;
-	if (focusOk)
-	{
-		shown = cands[best].ped; shownModel = cands[best].model;
-	}
-	else
-	{
-		uint32_t models[96]; int nm = 0;
-		for (int i = 0; i < nc && nm < 96; i++) models[nm++] = cands[i].model;
-		const OnlineModel *mm = nullptr;
-		int ms = HudMissingStableSlot(models, nm, &mm);
-		if (ms >= 0 && mm) { shown = (Ped)(-1000 - ms); shownModel = 0; om = mm; slot = ms; how = "elimination"; }
-		else
-		{
-			candPed = 0; candCount = 0;
-			if (holdsOurs) HudClearOurs(cont, haveOurs);
-			return;
-		}
-	}
-
-	g_shopShownPed = 0; g_shopShownSlot = -1;
-	if (shown > 0)
-	{
-		g_shopShownPed = shown;
-		for (int sl = 0; sl < kSlots; sl++) if (SlotPed(sl) == shown) { g_shopShownSlot = sl; break; }
-	}
-
-	if (shown != candPed || camMoved > 0.15f)
-	{
-		if (shown != candPed && holdsOurs) HudClearOurs(cont, haveOurs);
-		candPed = shown; candCount = 1; return;
-	}
-	if (candCount < 3) { candCount++; return; }
-
-	if (!om) om = HudIdentity(shown, shownModel, slot, how);
-
-	if (!om)
-	{
-		if (holdsOurs) HudClearOurs(cont, haveOurs);
-		return;
-	}
-
-	if (curBreed != 0 && curBreed != kBlankBreed && !holdsOurs && !strcmp(how, "pedModel")) return;
-
-	const char *type = TypeLabelFor(*om);
-	const char *coat = CoatLabelFor(om->name);
-	string breedKey = BreedKey(om->name);
-	const uint32_t wantType = Joaat(type), wantBreed = Joaat(breedKey.c_str());
-	const uint32_t wantCoat = coat ? Joaat(coat) : 0;
-	if (curType == wantType && curBreed == wantBreed && curCoat == wantCoat) { haveOurs = true; oursType = curType; oursBreed = curBreed; oursCoat = curCoat; return; }
-	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseType", (Hash)wantType);
-	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseBreed", (Hash)wantBreed);
-	invoke<Void>(0x0971F04E1EAA7AE8ull, cont, "HorseCoat", (Hash)wantCoat);
-	oursType = DbReadHash(cont, "HorseType"); oursBreed = DbReadHash(cont, "HorseBreed"); oursCoat = DbReadHash(cont, "HorseCoat"); haveOurs = true;
+	for (int i = 0; i < 3; i++)
+		if (values[i] != 0 && DbReadHash(scene, fields[i]) != values[i])
+			invoke<Void>(0x0971F04E1EAA7AE8ull, scene, fields[i], values[i]);
 }
 
 static void ApplyStableHudSafe(bool inMenu)
@@ -5389,27 +5885,106 @@ static const CoatSet kCoatSets[] = {
 	{ "War", 0x9B099788, kCoat_suffolkpunch_redchestnut_Modded, (int)(sizeof(kCoat_suffolkpunch_redchestnut_Modded) / sizeof(CoatTag)), kCoat_suffolkpunch_redchestnut_Vanilla, (int)(sizeof(kCoat_suffolkpunch_redchestnut_Vanilla) / sizeof(CoatTag)) },
 };
 
-struct CoatState { Ped ped; DWORD model; bool modded; DWORD lastApplied; };
+struct CoatState
+{
+	Ped ped;
+	DWORD model;
+	string owner;
+	const CoatSet *coatSet;
+	DWORD lastApplied;
+	bool wasVisible;
+	bool refreshPending;
+	bool triedDirectTint;
+	vector<CoatTag> originalTags;
+};
 static vector<CoatState> g_coatStates;
 
-// Flag 207 is the game's built-in "Flaming Hooves Active" ped config flag.
-// The effect is native to RDR2/RDO; no custom particle dictionary is needed.
 struct FlamingHoovesState { Ped ped; DWORD model; };
 static vector<FlamingHoovesState> g_flamingHoovesStates;
 
 static int CollectHorseCandidates(Ped candidates[64]);
-static bool IsWarApocalypseHorse(Ped ped, DWORD model)
-{
-    if (ped == 0 || !ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped))
-        return false;
+static Ped g_stableApocalypsePreview = 0;
 
-    for (size_t i = 0; i < g_apocalypseHorses.size(); ++i)
-    {
-        const ApocalypseHorseEntry &entry = g_apocalypseHorses[i];
-        if (entry.name == "War" && ApocalypseEntryMatchesContext(entry, ped, model))
-            return true;
-    }
-    return false;
+static Ped FindStableApocalypsePreview(bool inStable)
+{
+	static Ped sourceHorse = 0;
+	static DWORD sourceModel = 0;
+	static Ped preview = 0;
+	static Ped previousPreview = 0;
+
+	if (!inStable)
+	{
+		sourceHorse = 0;
+		preview = 0;
+		previousPreview = 0;
+		return 0;
+	}
+
+	const Ped horse = SlotPed(0);
+	DWORD realModel = 0;
+	static const DWORD stableHash = Joaat("shop_horse_shop_sp");
+	if (horse != sourceHorse)
+	{
+		if (preview) previousPreview = preview;
+		sourceHorse = horse;
+		sourceModel = 0;
+		preview = 0;
+	}
+
+	const bool eligible = FindApocalypseHorse(horse, &realModel) != nullptr;
+	if (realModel == 0 || SCRIPT::_GET_NUMBER_OF_INSTANCES_OF_SCRIPT_WITH_NAME_HASH(stableHash) != 1) return 0;
+
+	if (sourceModel != realModel)
+	{
+		if (preview) previousPreview = preview;
+		sourceModel = realModel;
+		preview = 0;
+	}
+
+	Ped slotPeds[kSlots];
+	for (int slot = 0; slot < kSlots; slot++) slotPeds[slot] = SlotPed(slot);
+
+	const DWORD visibleModel = ENTITY::GET_ENTITY_MODEL(horse);
+	auto matchesPreview = [&](Ped ped)
+	{
+		if (!ped || !ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped) ||
+			!ENTITY::IS_ENTITY_A_MISSION_ENTITY(ped)) return false;
+		const DWORD model = ENTITY::GET_ENTITY_MODEL(ped);
+		if (model != visibleModel && model != realModel) return false;
+		for (Ped slotPed : slotPeds)
+			if (slotPed == ped) return false;
+		return true;
+	};
+
+	if (preview && matchesPreview(preview)) return eligible ? preview : 0;
+	preview = 0;
+
+	if (previousPreview && !ENTITY::DOES_ENTITY_EXIST(previousPreview)) previousPreview = 0;
+
+	Ped candidates[64];
+	const int count = CollectHorseCandidates(candidates);
+	Ped taggedPreview = 0;
+	for (int i = 0; i < count; i++)
+	{
+		const Ped ped = candidates[i];
+		if (ped == previousPreview || !matchesPreview(ped) ||
+			!PED::GET_PED_RESET_FLAG(ped, 291)) continue;
+		if (taggedPreview != 0)
+		{
+			preview = 0;
+			return 0;
+		}
+		taggedPreview = ped;
+	}
+
+	preview = taggedPreview;
+	return eligible ? preview : 0;
+}
+
+static const ApocalypseHorseEntry *FindApocalypseVisualHorse(Ped ped)
+{
+	if (ped != 0 && ped == g_stableApocalypsePreview) return FindApocalypseHorse(SlotPed(0));
+	return FindApocalypseHorse(ped);
 }
 
 static void SetFlamingHooves(Ped ped, bool enabled)
@@ -5417,62 +5992,45 @@ static void SetFlamingHooves(Ped ped, bool enabled)
     invoke<Void>(0x1913FE4CBF41C463ull, ped, 207, enabled);
 }
 
-static void UpdateApocalypseFlamingHooves()
+static void UpdateApocalypseFlamingHooves(const Ped horses[], int count)
 {
-    // Remove the flag from horses that no longer satisfy War's model/name/gender requirements, and discard handles that have been despawned.
-    for (size_t i = 0; i < g_flamingHoovesStates.size();)
-    {
-        Ped ped = g_flamingHoovesStates[i].ped;
-        if (!ENTITY::DOES_ENTITY_EXIST(ped))
-        {
-            g_flamingHoovesStates.erase(g_flamingHoovesStates.begin() + i);
-            continue;
-        }
+	for (size_t i = 0; i < g_flamingHoovesStates.size();)
+	{
+		const FlamingHoovesState &state = g_flamingHoovesStates[i];
+		const bool sameModel = ENTITY::DOES_ENTITY_EXIST(state.ped) &&
+			ENTITY::GET_ENTITY_MODEL(state.ped) == state.model;
+		const ApocalypseHorseEntry *entry = sameModel && g_apocalypseVisuals ?
+			FindApocalypseVisualHorse(state.ped) : nullptr;
+		if (entry && entry->name == "War")
+		{
+			i++;
+			continue;
+		}
 
-        DWORD model = (DWORD)ENTITY::GET_ENTITY_MODEL(ped);
-        if (model != g_flamingHoovesStates[i].model ||
-            !IsWarApocalypseHorse(ped, model))
-        {
-            SetFlamingHooves(ped, false);
-            g_flamingHoovesStates.erase(g_flamingHoovesStates.begin() + i);
-            continue;
-        }
-        ++i;
-    }
+		if (sameModel) SetFlamingHooves(state.ped, false);
+		g_flamingHoovesStates.erase(g_flamingHoovesStates.begin() + i);
+	}
 
-    Ped candidates[64];
-    int candidateCount = CollectHorseCandidates(candidates);
+	if (g_apocalypseVisuals == 0) return;
 
-    for (int i = 0; i < candidateCount; ++i)
-    {
-        Ped ped = candidates[i];
-        if (!ENTITY::DOES_ENTITY_EXIST(ped)) continue;
-        DWORD model = (DWORD)ENTITY::GET_ENTITY_MODEL(ped);
-        if (!IsWarApocalypseHorse(ped, model)) continue;
+	for (int i = 0; i < count; i++)
+	{
+		const Ped ped = horses[i];
+		const ApocalypseHorseEntry *entry = FindApocalypseVisualHorse(ped);
+		if (!entry || entry->name != "War") continue;
 
-        bool tracked = false;
-        for (size_t j = 0; j < g_flamingHoovesStates.size(); ++j)
-        {
-            if (g_flamingHoovesStates[j].ped == ped && g_flamingHoovesStates[j].model == model)
-            {
-                tracked = true;
-                break;
-            }
-        }
-        // Reassert the flag periodically in case a stable interaction or component refresh resets the ped config flags.
-        SetFlamingHooves(ped, true);
-        if (!tracked)
-        {
-            FlamingHoovesState state = { ped, model };
-            g_flamingHoovesStates.push_back(state);
-        }
-    }
+		SetFlamingHooves(ped, true);
+		bool tracked = false;
+		for (const FlamingHoovesState &state : g_flamingHoovesStates)
+			if (state.ped == ped) { tracked = true; break; }
+		if (!tracked) g_flamingHoovesStates.push_back({ ped, ENTITY::GET_ENTITY_MODEL(ped) });
+	}
 }
 
-static const CoatSet *FindCoatSet(DWORD model, const char *owner = nullptr)
+static const CoatSet *FindCoatSet(DWORD model, const char *owner)
 {
 	for (size_t i = 0; i < sizeof(kCoatSets) / sizeof(kCoatSets[0]); i++)
-		if (kCoatSets[i].model == model && (!owner || strcmp(kCoatSets[i].owner, owner) == 0)) return &kCoatSets[i];
+		if (kCoatSets[i].model == model && strcmp(kCoatSets[i].owner, owner) == 0) return &kCoatSets[i];
 	return nullptr;
 }
 
@@ -5541,8 +6099,6 @@ static int CollectHorseCandidates(Ped candidates[64])
 		if (g_saddleHorse != 0) NoteOwnedHorse(g_saddleHorse);
 	}
 
-	int discovery[32]; int discoveryCount = 0;
-
 	SlotInfo snap[kSlots];
 	for (int s = 0; s < kSlots; s++) snap[s] = ReadSlot(s);
 
@@ -5551,7 +6107,6 @@ static int CollectHorseCandidates(Ped candidates[64])
 	{
 		candidates[candidateCount++] = mount;
 		NoteOwnedHorse(mount);
-		if (discoveryCount < 32 && CouldBeOwnedSlot(mount, snap)) discovery[discoveryCount++] = (int)mount;
 	}
 
 	if (g_saddleHorse != 0)
@@ -5560,7 +6115,6 @@ static int CollectHorseCandidates(Ped candidates[64])
 		for (int j = 0; j < candidateCount; j++)
 			if (candidates[j] == g_saddleHorse) { duplicate = true; break; }
 		if (!duplicate) candidates[candidateCount++] = g_saddleHorse;
-		if (discoveryCount < 32 && CouldBeOwnedSlot(g_saddleHorse, snap)) discovery[discoveryCount++] = (int)g_saddleHorse;
 	}
 
 	Ped nearbyList[64]; int nearbyCount = 0;
@@ -5586,6 +6140,12 @@ static int CollectHorseCandidates(Ped candidates[64])
 		candidates[candidateCount++] = p;
 		return true;
 	};
+	for (int slot = 0; slot < kSlots; slot++)
+	{
+		if (!snap[slot].ok || snap[slot].state == 0) continue;
+		Ped ped = SlotPed(slot);
+		if (ped != 0 && ENTITY::DOES_ENTITY_EXIST(ped) && !ENTITY::IS_ENTITY_DEAD(ped)) addOne(ped);
+	}
 	auto isRelevantModel = [&](Ped p) -> bool
 	{
 		uint32_t m = (uint32_t)ENTITY::GET_ENTITY_MODEL(p);
@@ -5598,17 +6158,13 @@ static int CollectHorseCandidates(Ped candidates[64])
 
 	for (int i = 0; i < nearbyCount; i++)
 	{
-		bool rel = isRelevantModel(nearbyList[i]);
-		if (rel && discoveryCount < 32) discovery[discoveryCount++] = (int)nearbyList[i];
-		if (rel) addOne(nearbyList[i]);
+		if (isRelevantModel(nearbyList[i])) addOne(nearbyList[i]);
 	}
 	for (int i = 0; i < nw; i++)
 	{
 		Ped p = (Ped)world[i];
 		if (p == 0 || !ENTITY::DOES_ENTITY_EXIST(p) || ENTITY::IS_ENTITY_DEAD(p)) continue;
-		bool rel = isRelevantModel(p);
-		if (rel && discoveryCount < 32) discovery[discoveryCount++] = (int)p;
-		if (rel) addOne(p);
+		if (isRelevantModel(p)) addOne(p);
 	}
 	for (int i = 0; i < nearbyCount; i++) addOne(nearbyList[i]);
 	for (int i = 0; i < nw; i++)
@@ -5618,95 +6174,222 @@ static int CollectHorseCandidates(Ped candidates[64])
 		addOne(p);
 	}
 
-	if (discoveryCount > 0) DiscoverEntField(discovery, discoveryCount);
 	cachedCount = candidateCount;
 	for (int i = 0; i < candidateCount; i++) cachedCandidates[i] = candidates[i];
 	return candidateCount;
 }
 
+static bool ReadCoatTag(Ped ped, int index, CoatTag &tag)
+{
+	return invoke<BOOL>(0xA9C28516A6DC9D56ull, ped, index, &tag.drawable,
+		&tag.albedo, &tag.normal, &tag.material) && tag.drawable != 0 &&
+		invoke<BOOL>(0xE7998FEC53A33BBEull, ped, index, &tag.palette,
+			&tag.tint0, &tag.tint1, &tag.tint2);
+}
+
+enum CoatTintResult { CoatTagsMatch, CoatTintsChanged, CoatRebuildRequired };
+
+static CoatTintResult ApplyLoadedCoatTints(Ped ped, const CoatTag *tags, int count, bool tryDirectTint)
+{
+	const int components = PED::_GET_NUM_COMPONENT_CATEGORIES_IN_PED(ped);
+	if (components <= 0 || components >= 256) return CoatRebuildRequired;
+
+	vector<bool> found(count, false);
+	vector<DWORD> categories(count, 0);
+	int remaining = 0;
+	for (int j = 0; j < count; j++)
+		if (tags[j].type == coat) remaining++;
+
+	for (int i = 0; i < components && remaining > 0; i++)
+	{
+		CoatTag current(coat, 0.0f);
+		if (!ReadCoatTag(ped, i, current)) continue;
+
+		for (int j = 0; j < count; j++)
+		{
+			const CoatTag &expected = tags[j];
+			if (found[j] || expected.type != coat || current.drawable != expected.drawable ||
+				current.albedo != expected.albedo || current.normal != expected.normal ||
+				current.material != expected.material) continue;
+
+			if (expected.palette != 0 && (current.palette != expected.palette ||
+				current.tint0 != expected.tint0 || current.tint1 != expected.tint1 ||
+				current.tint2 != expected.tint2))
+			{
+				if (!tryDirectTint) return CoatRebuildRequired;
+				categories[j] = (DWORD)PED::_GET_PED_COMPONENT_CATEGORY_BY_INDEX(ped, i);
+				if (categories[j] == 0) return CoatRebuildRequired;
+			}
+			found[j] = true;
+			remaining--;
+			break;
+		}
+	}
+
+	if (remaining != 0) return CoatRebuildRequired;
+
+	bool changed = false;
+	for (int j = 0; j < count; j++)
+	{
+		if (categories[j] == 0) continue;
+		const CoatTag &tag = tags[j];
+		PED::_0x4EFC1F8FF1AD94DE(ped, categories[j], tag.palette, tag.tint0, tag.tint1, tag.tint2);
+		changed = true;
+	}
+	return changed ? CoatTintsChanged : CoatTagsMatch;
+}
+
+static vector<CoatTag> ReadHorseHairTags(Ped ped)
+{
+	vector<CoatTag> tags;
+	const int count = PED::_GET_NUM_COMPONENT_CATEGORIES_IN_PED(ped);
+	if (count <= 0 || count >= 256) return tags;
+
+	for (int i = 0; i < count; i++)
+	{
+		const DWORD category = (DWORD)PED::_GET_PED_COMPONENT_CATEGORY_BY_INDEX(ped, i);
+		if (category != 0xAA0217AB && category != 0xA63CAE10) continue;
+
+		CoatTag tag(coat, 0.0f);
+		if (ReadCoatTag(ped, i, tag)) tags.push_back(tag);
+	}
+	return tags;
+}
+
 static void ApplyApocalypseVisuals()
 {
-	static DWORD lastFrame = 0;
-	DWORD now = GetTickCount();
-	if (now == lastFrame) return;
-	lastFrame = now;
+	static DWORD lastUpdate = 0;
+	static int previousSlot = -1;
+	static bool wasInStable = false;
+	const bool inStable = StableShopUiActive();
+	const DWORD now = GetTickCount();
+	if (!inStable && !wasInStable && now - lastUpdate < 200) return;
+	lastUpdate = now;
+	wasInStable = inStable;
 
-    // Enable the game's native flaming-hooves effect on eligible War horses.
-    UpdateApocalypseFlamingHooves();
+	const int selectedSlot = inStable ? GetSelectedStableSlot() : -1;
+	const bool selectionChanged = selectedSlot != previousSlot;
+	previousSlot = selectedSlot;
 
+	g_stableApocalypsePreview =
+		FindStableApocalypsePreview(inStable && g_apocalypseVisuals != 0);
+
+	Ped horses[kSlots + 1];
+	for (int slot = 0; slot < kSlots; slot++) horses[slot] = SlotPed(slot);
+	horses[kSlots] = g_stableApocalypsePreview;
 	for (size_t i = 0; i < g_coatStates.size();)
 	{
-		if (!ENTITY::DOES_ENTITY_EXIST(g_coatStates[i].ped)) g_coatStates.erase(g_coatStates.begin() + i);
-		else i++;
+		const CoatState &state = g_coatStates[i];
+		if (ENTITY::DOES_ENTITY_EXIST(state.ped) && ENTITY::GET_ENTITY_MODEL(state.ped) == state.model)
+		{
+			const ApocalypseHorseEntry *entry = g_apocalypseVisuals ? FindApocalypseVisualHorse(state.ped) : nullptr;
+			if (entry && entry->name == state.owner)
+			{
+				i++;
+				continue;
+			}
+
+			if (state.coatSet)
+			{
+				const CoatSet &cs = *state.coatSet;
+				ApplyCoatTags(state.ped, cs.vanilla, cs.nVanilla, cs.vanilla, cs.nVanilla);
+			}
+			else
+			{
+				const vector<CoatTag> &tags = state.originalTags;
+				ApplyCoatTags(state.ped, tags.data(), (int)tags.size(), nullptr, 0);
+			}
+		}
+		g_coatStates.erase(g_coatStates.begin() + i);
 	}
 
-	// Include the player's current mount explicitly. Some stable/shop scenes do not consistently return the mount in GET_PED_NEARBY_PEDS.
-	Ped candidates[64];
-	int candidateCount = CollectHorseCandidates(candidates);
-
-	for (int i = 0; i < candidateCount; i++)
+	if (g_apocalypseVisuals == 0)
 	{
-		Ped ped = candidates[i];
-		if (!ENTITY::DOES_ENTITY_EXIST(ped)) continue;
-
-		DWORD model = (DWORD)ENTITY::GET_ENTITY_MODEL(ped);
-
-		if (!FindCoatSet(model)) continue;
-
-		bool want = false;
-		if (g_apocalypseVisuals != 0 && !ENTITY::IS_ENTITY_DEAD(ped))
-		{
-			for (size_t e = 0; e < g_apocalypseHorses.size() && !want; e++)
-			{
-				const ApocalypseHorseEntry &entry = g_apocalypseHorses[e];
-				const CoatSet *cs = FindCoatSet(model, entry.name.c_str());
-				if (!cs) continue;
-				if (ApocalypseEntryMatchesContext(entry, ped, model)) want = true;
-			}
-		}
-
-		int idx = -1;
-		for (size_t k = 0; k < g_coatStates.size(); k++)
-			if (g_coatStates[k].ped == ped && g_coatStates[k].model == model) { idx = (int)k; break; }
-
-		if (idx < 0 && !want) continue;
-
-		// The stable can rebuild a horse's components when its UI closes.
-		// Re-apply modded visuals periodically even when our logical state
-		// has not changed, otherwise the cache would hide the game's reset.
-		if (idx >= 0 && g_coatStates[idx].modded == want)
-		{
-			if (!want) continue;
-			DWORD reapplyMs = StableShopUiActive() ? 150 : 1000;
-			if (now - g_coatStates[idx].lastApplied < reapplyMs) continue;
-		}
-
-		const CoatSet *cs = FindCoatSet(model);
-		if (want)
-		{
-			for (size_t e = 0; e < g_apocalypseHorses.size(); e++)
-			{
-				const CoatSet *c2 = FindCoatSet(model, g_apocalypseHorses[e].name.c_str());
-				if (c2 && ApocalypseEntryMatchesContext(g_apocalypseHorses[e], ped, model)) { cs = c2; break; }
-			}
-			ApplyCoatTags(ped, cs->modded, cs->nModded, cs->vanilla, cs->nVanilla);
-		}
-		else
-		{
-			ApplyCoatTags(ped, cs->vanilla, cs->nVanilla, cs->vanilla, cs->nVanilla);
-		}
-
-		if (idx >= 0)
-		{
-			g_coatStates[idx].modded = want;
-			g_coatStates[idx].lastApplied = now;
-		}
-		else
-		{
-			CoatState st = { ped, model, want, now };
-			g_coatStates.push_back(st);
-		}
+		UpdateApocalypseFlamingHooves(horses, kSlots);
+		return;
 	}
+
+	for (int i = 0; i <= kSlots; i++)
+	{
+		const Ped ped = horses[i];
+		const bool selectedHorse = i == selectedSlot || (i == kSlots && selectedSlot == 0);
+		const ApocalypseHorseEntry *entry = FindApocalypseVisualHorse(ped);
+		if (!entry) continue;
+
+		CoatState *state = nullptr;
+		for (CoatState &tracked : g_coatStates)
+			if (tracked.ped == ped) { state = &tracked; break; }
+
+		const bool visible = inStable && ENTITY::IS_ENTITY_VISIBLE(ped);
+		const DWORD reapplyMs = inStable ? (selectedHorse ? 16 : 32) : 1000;
+		if (state)
+		{
+			if (inStable && ((selectionChanged && selectedHorse) || (visible && !state->wasVisible)))
+				state->refreshPending = true;
+			state->wasVisible = visible;
+			if (!state->refreshPending && now - state->lastApplied < reapplyMs) continue;
+		}
+		CoatState pending = {};
+		if (!state)
+		{
+			const DWORD model = ENTITY::GET_ENTITY_MODEL(ped);
+			const CoatSet *coatSet = FindCoatSet(model, entry->name.c_str());
+			vector<CoatTag> originalTags = coatSet ? vector<CoatTag>() : ReadHorseHairTags(ped);
+			if (!coatSet && originalTags.empty()) continue;
+			pending = { ped, model, entry->name, coatSet, now, visible, false, false, originalTags };
+			state = &pending;
+		}
+
+		const CoatTag *moddedTags = nullptr;
+		int moddedCount = 0;
+		const CoatTag *vanillaTags = nullptr;
+		int vanillaCount = 0;
+		vector<CoatTag> tintedTags;
+		if (state->coatSet)
+		{
+			const CoatSet &cs = *state->coatSet;
+			moddedTags = cs.modded;
+			moddedCount = cs.nModded;
+			vanillaTags = cs.vanilla;
+			vanillaCount = cs.nVanilla;
+		}
+		else
+		{
+			tintedTags = state->originalTags;
+			const bool pestilence = entry->name == "Pestilence";
+			for (CoatTag &tag : tintedTags)
+			{
+				tag.palette = 0xA4041CEF;
+				tag.tint0 = tag.tint2 = pestilence ? 99 : 138;
+				tag.tint1 = pestilence ? 195 : 138;
+			}
+			moddedTags = tintedTags.data();
+			moddedCount = (int)tintedTags.size();
+		}
+
+		const CoatTintResult tint = inStable ?
+			ApplyLoadedCoatTints(ped, moddedTags, moddedCount, !state->triedDirectTint) :
+			CoatRebuildRequired;
+		if (tint == CoatRebuildRequired)
+		{
+			if (inStable && !PED::_0xA0BC8FAED8CFEB3C(ped)) continue;
+			ApplyCoatTags(ped, moddedTags, moddedCount, vanillaTags, vanillaCount);
+		}
+		else
+		{
+			const float moddedScale = FindCoatScale(moddedTags, moddedCount);
+			const float vanillaScale = FindCoatScale(vanillaTags, vanillaCount);
+			if (moddedScale > 0.0f && vanillaScale > 0.0f)
+				invoke<Void>(0x25ACFC650B65C538, ped, moddedScale / vanillaScale);
+
+			state->triedDirectTint = tint == CoatTintsChanged;
+		}
+		state->lastApplied = now;
+		state->refreshPending = false;
+		if (state == &pending) g_coatStates.push_back(pending);
+	}
+
+	UpdateApocalypseFlamingHooves(horses, kSlots + 1);
 }
 
 static void ApplyApocalypseAlwaysCleanCalm()
@@ -5718,7 +6401,7 @@ static void ApplyApocalypseAlwaysCleanCalm()
 	{
 		Ped horse = candidates[i];
 		if (!ENTITY::DOES_ENTITY_EXIST(horse) || ENTITY::IS_ENTITY_DEAD(horse)) continue;
-		if (!IsApocalypseHorse(horse)) continue;
+		if (!FindApocalypseHorse(horse)) continue;
 
 		invoke<Void>(0x6585D955A68452A5ull, horse);
 		PED::CLEAR_PED_WETNESS(horse);
@@ -5916,27 +6599,38 @@ static void ApplyOnlineStats()
 {
 	static DWORD last = 0;
 	DWORD now = GetTickCount();
-	if (now - last < 500) return;
+	const bool shop = StableShopUiActive();
+	if (now - last < (shop ? 150u : 500u)) return;
 	last = now;
 
-	int buf[32 + 1]; buf[0] = 32;
-	int count = PED::GET_PED_NEARBY_PEDS(PLAYER::PLAYER_PED_ID(), buf, -1, -1);
-	for (int i = 0; i < count && i < 32; i++)
+	for (size_t i = 0; i < g_perfectHorseOriginalStats.size();)
 	{
-		Ped ped = (Ped)buf[i + 1];
+		const PerfectHorseOriginalStats &stats = g_perfectHorseOriginalStats[i];
+		if (g_perfectHorses == 0 || !ENTITY::DOES_ENTITY_EXIST(stats.horse) ||
+			ENTITY::GET_ENTITY_MODEL(stats.horse) != stats.model || !FindApocalypseHorse(stats.horse))
+			RestorePerfectHorseStats(stats.horse);
+		else
+			i++;
+	}
+
+	Ped candidates[64];
+	const int count = CollectHorseCandidates(candidates);
+	for (int i = 0; i < count; i++)
+	{
+		Ped ped = candidates[i];
 		if (!ENTITY::DOES_ENTITY_EXIST(ped) || ENTITY::IS_ENTITY_DEAD(ped)) continue;
-		uint32_t model = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
+		if (ApplyPerfectHorseStats(ped)) continue;
+		const uint32_t model = (uint32_t)ENTITY::GET_ENTITY_MODEL(ped);
 		int d = -1;
 		for (int k = 0; k < F_COUNT; k++) if (kDonors[k].model == model) d = k;
-		if (d >= 0 && g_map[d].valid && DonorHeld(d)) continue;
-		if (g_perfectHorses != 0 && IsApocalypseHorse(ped))
-		{
-			ApplyPerfectHorseStats(ped);
-			continue;
-		}
-		const HorseName *hn = HorseNameOf(model);
+		const bool disguised = d >= 0 && g_map[d].valid && DonorHeld(d);
+		if (disguised && !shop) continue;
+		const uint32_t statModel = disguised ? g_map[d].realModel : model;
+
+		const HorseName *hn = HorseNameOf(statModel);
 		if (!hn) continue;
-		const OnlineModel *om = FindOnline(model);
+
+		const OnlineModel *om = FindOnline(statModel);
 		int stat[4];
 		if (!CustomStatsFor(hn->name, hn->alt, stat))
 		{
@@ -5955,6 +6649,71 @@ static void ApplyOnlineStats()
 		if (!diff) continue;
 		for (int k = 0; k < 4; k++)
 			if (cur[k] != want[k]) invoke<Void>(0x5DA12E025D47D4E5ull, ped, attr[k], want[k]);
+	}
+}
+
+static void UpdateApocalypseStableStats()
+{
+	static const char *const keys[2][3] = {
+		{ "HorseSpeedValue", "HorseSpeedCapacityValue", "HorseSpeedEquipmentValue" },
+		{ "HorseAccValue", "HorseAccCapacityValue", "HorseAccEquipmentValue" },
+	};
+	static Any previousScene = 0;
+	static Ped previousHorse = 0;
+	static int original[2][3] = {};
+	static int applied[2][3] = {};
+	static bool showingBonus[2] = {};
+
+	const Any scene = StableShopUiActive() ? FindSceneContainer() : 0;
+	const int slot = scene ? GetSelectedStableSlot() : -1;
+	const Ped horse = SlotPed(slot);
+	if (scene != previousScene || horse != previousHorse)
+	{
+		previousScene = scene;
+		previousHorse = horse;
+		showingBonus[0] = showingBonus[1] = false;
+	}
+
+	if (horse == 0 || !scene) return;
+	const bool eligible = g_perfectHorses != 0 && FindApocalypseHorse(horse);
+
+	for (int stat = 0; stat < 2; stat++)
+	{
+		if (!eligible && !showingBonus[stat]) continue;
+		int current[3];
+		for (int field = 0; field < 3; field++)
+			current[field] = DbReadInt(scene, keys[stat][field]);
+
+		if (current[0] < 1 || current[0] > 10 || current[1] < current[0] || current[1] > 10 ||
+			current[2] < 0 || current[2] > 1000) continue;
+
+		int values[3];
+		if (eligible)
+		{
+			for (int field = 0; field < 3; field++)
+				if (!showingBonus[stat] || current[field] != applied[stat][field])
+					original[stat][field] = current[field];
+
+			const int base = (int)ATTRIBUTE::_0x147149F2E909323C(horse, 5 + stat) + 1;
+			values[0] = base < 1 ? 1 : (base > 10 ? 10 : base);
+			const int capacity = values[0] + (stat == 0 ? 3 : 2);
+			values[1] = capacity > 10 ? 10 : capacity;
+			const int equipment = original[stat][2] + (values[0] - original[stat][0]) * 100;
+			values[2] = original[stat][2] == 0 || equipment < 0 ? 0 : (equipment > 1000 ? 1000 : equipment);
+		}
+		else
+		{
+			for (int field = 0; field < 3; field++)
+				values[field] = current[field] == applied[stat][field] ? original[stat][field] : current[field];
+		}
+
+		for (int field = 0; field < 3; field++)
+		{
+			if (current[field] != values[field])
+				invoke<Void>(0x9EFA98238BA08FC4ull, scene, keys[stat][field], values[field]);
+			applied[stat][field] = values[field];
+		}
+		showingBonus[stat] = eligible;
 	}
 }
 
@@ -6179,8 +6938,7 @@ static void BlanketRemover_Tick()
 
 void OnlineHorses_Init()
 {
-	for (size_t i = 0; i < sizeof(kOnlineModels) / sizeof(kOnlineModels[0]); i++)
-	{ OnlineModel m = { Joaat(kOnlineModels[i]), BreedOf(kOnlineModels[i]), string(kOnlineModels[i]) }; g_online.push_back(m); }
+	if (g_enabled) return;
 
 	uint32_t hdr = 0;
 	if (!RdG(kArrayHeader, hdr) || hdr != (uint32_t)kSlots) return;
@@ -6189,6 +6947,9 @@ void OnlineHorses_Init()
 		SlotInfo s = ReadSlot(i);
 		if (!s.ok || s.state > 2) return;
 	}
+
+	for (const char *name : kOnlineModels)
+		g_online.push_back({ Joaat(name), BreedOf(name), name });
 
 	ToReal();
 	RenameNewlyAcquired();
@@ -6215,21 +6976,30 @@ static bool AnyOnlineHorseOwned()
 
 void OnlineHorses_Tick(bool nearStable)
 {
-	if (!g_enabled) return;
 	static DWORD lastPoll = 0;
 	DWORD now = GetTickCount();
 
 	bool pause = UI::IS_PAUSE_MENU_ACTIVE() != 0;
 
-	if (now - lastPoll < 200) return;
+	if (now - lastPoll < 200)
+	{
+		if (g_enabled)
+		{
+			ApplyStableHudSafe(!pause);
+			ApplyApocalypseVisuals();
+		}
+		return;
+	}
 	lastPoll = now;
+
+	OnlineHorses_Init();
+	if (!g_enabled) return;
 
 	RenameNewlyAcquired();
 
 	static bool first = true;
 	static DWORD calmSince = 0;
 	bool ctrlOn = PLAYER::IS_PLAYER_CONTROL_ON(PLAYER::PLAYER_ID()) != 0;
-	bool gameCam = CAM::IS_GAMEPLAY_CAM_RENDERING() != 0;
 	int approachStable = GetStableApproachAtPlayerPos(12.0f);
 	bool shopUi = StableShopUiActive() && AnyOnlineHorseOwned();
 	bool stableContext = nearStable || approachStable >= 0 || shopUi;
@@ -6263,10 +7033,11 @@ void OnlineHorses_Tick(bool nearStable)
 	MapPrune(ctrlOn && !pause);
 	RetireDonorActiveHorse();
 	RetireMappedDonorPeds();
-	ApplyOnlineStats();
+	ApplyStableHudSafe(!pause);
 	ApplyApocalypseVisuals();
+	ApplyOnlineStats();
+	UpdateApocalypseStableStats();
 	ApplyApocalypseAlwaysCleanCalm();
-	ApplyStableHudSafe(g_donorMode && !gameCam);
 }
 
 void DrawText(float x, float y, char *str)
@@ -6666,6 +7437,173 @@ namespace StoryHorseRename
 		return CodePtr(pages, size, start);
 	}
 
+	struct BonusPriceCall
+	{
+		uint32_t multiplier = 0;
+		uint32_t destination = 0;
+		uint16_t oldValue = 0;
+		uint16_t newValue = 0;
+		bool wide = false;
+	};
+
+	static constexpr uint32_t kBonusHorseItems[] = { 0x642DA5B7, 0xDAF88C3F };
+	static constexpr uint32_t kBonusDiscountIds[] = {
+		static_cast<uint32_t>(-447735677), static_cast<uint32_t>(-1087485820)
+	};
+
+	static uint32_t ReadOperand(const uint8_t *bytes)
+	{
+		uint32_t value;
+		memcpy(&value, bytes, sizeof(value));
+		return value;
+	}
+
+	static bool FindBonusPriceCalls(const vector<uint8_t> &code, BonusPriceCall (&hits)[2][2])
+	{
+		unsigned counts[2] = {};
+		for (uint32_t pos = 0; pos + 19 <= code.size(); ++pos)
+		{
+			const uint8_t *op = code.data() + pos;
+			if (op[0] != 0x37) continue;
+
+			const uint32_t item = ReadOperand(op + 1);
+			const unsigned horse = item == kBonusHorseItems[0] ? 0 : item == kBonusHorseItems[1] ? 1 : 2;
+			if (horse == 2) continue;
+
+			uint32_t offset = 5;
+			uint16_t before = op[offset], after = 0x48;
+			const bool wide = before == 0x86;
+			if (wide)
+			{
+				const uint32_t bits = ReadOperand(op + offset + 1);
+				if (bits != 0 && bits != 0x3F800000) continue;
+				offset += 4;
+				before = static_cast<uint16_t>(bits >> 16);
+				after = 0x3F80;
+			}
+			else if (before != 0x73 && before != after)
+				continue;
+
+			if (op[offset + 1] != 0x37 || ReadOperand(op + offset + 2) != kBonusDiscountIds[horse] ||
+				op[offset + 6] != 0x39)
+				continue;
+			const uint32_t target = uint32_t(op[offset + 7]) |
+				(uint32_t(op[offset + 8]) << 8) | (uint32_t(op[offset + 9]) << 16);
+			if (target + 2 > code.size() || code[target] != kOpEnter || code[target + 1] != 4)
+				return false;
+			if (counts[horse] == 2) return false;
+			hits[horse][counts[horse]++] = BonusPriceCall{pos + offset - (wide ? 1 : 0), target, before, after, wide};
+		}
+		return counts[0] == 2 && counts[1] == 2 &&
+			hits[0][0].destination == hits[1][0].destination &&
+			hits[0][1].destination == hits[1][1].destination &&
+			hits[0][0].destination != hits[0][1].destination;
+	}
+
+	static bool HasBonusCashPrice(uint32_t item)
+	{
+		Any cost[74] = {};
+		cost[2 * 4] = 15;
+		cost[2 * 36] = 10;
+		static const uint32_t cash = Joaat("CURRENCY_CASH");
+		static const uint32_t shopCost = Joaat("COST_SHOP_DEFAULT");
+		if (!ITEMDATABASE::_0x74F7928816E4E181(item, shopCost, cost)) return false;
+
+		const uint32_t count = cost[2 * 3];
+		if (count > 15) return false;
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			const uint32_t index = 2 * (5 + 2 * i);
+			if (cost[index] == cash && static_cast<int32_t>(cost[index + 2]) > 0)
+				return true;
+		}
+		return false;
+	}
+
+	static bool WritePriceOpcode(uint8_t *address, uint8_t from, uint8_t to)
+	{
+		uint8_t current = 0;
+		if (!address || !Satchel_Read(reinterpret_cast<uintptr_t>(address), current) || current != from)
+			return false;
+		DWORD protection = 0;
+		if (!VirtualProtect(address, 1, PAGE_READWRITE, &protection)) return false;
+		SIZE_T written = 0;
+		const bool ok = WriteProcessMemory(GetCurrentProcess(), address, &to, 1, &written) && written == 1;
+		DWORD ignored = 0;
+		VirtualProtect(address, 1, protection, &ignored);
+		return ok;
+	}
+
+	static bool WritePriceMultiplier(uint8_t **pages, uint32_t size, const BonusPriceCall &call, bool restore)
+	{
+		const uint16_t from = restore ? call.newValue : call.oldValue;
+		const uint16_t to = restore ? call.oldValue : call.newValue;
+		if (from == to) return true;
+
+		uint8_t *first = CodePtr(pages, size, call.multiplier);
+		if (!WritePriceOpcode(first, static_cast<uint8_t>(from), static_cast<uint8_t>(to))) return false;
+		if (!call.wide || WritePriceOpcode(CodePtr(pages, size, call.multiplier + 1),
+			static_cast<uint8_t>(from >> 8), static_cast<uint8_t>(to >> 8))) return true;
+
+		WritePriceOpcode(first, static_cast<uint8_t>(to), static_cast<uint8_t>(from));
+		return false;
+	}
+
+	static void TryBonusPricePatch(GetScrProgramFn getProgram, uint32_t hash)
+	{
+		static uintptr_t checked = 0;
+		const auto program = reinterpret_cast<uintptr_t>(getProgram(hash));
+		if (!program)
+		{
+			checked = 0;
+			return;
+		}
+		if (checked == program) return;
+
+		const bool price[] = { HasBonusCashPrice(kBonusHorseItems[0]), HasBonusCashPrice(kBonusHorseItems[1]) };
+		if (!price[0] && !price[1]) return;
+
+		uintptr_t pageTable = 0;
+		uint32_t size = 0;
+		if (!Satchel_Read(program + 0x10, pageTable) || !pageTable ||
+			!Satchel_Read(program + 0x1C, size) || size < 0x1000 || size > 0x400000)
+			return;
+
+		vector<uint8_t> code(size);
+		vector<uint8_t *> pages((size + 0x3FFF) >> 14);
+		if (!Satchel_Read(pageTable, pages.data(), pages.size() * sizeof(pages[0]))) return;
+		for (size_t i = 0; i < pages.size(); ++i)
+		{
+			const size_t offset = i << 14;
+			const size_t length = size - offset < 0x4000 ? size - offset : 0x4000;
+			if (!pages[i] || !Satchel_Read(reinterpret_cast<uintptr_t>(pages[i]), code.data() + offset, length))
+				return;
+		}
+		checked = program;
+
+		BonusPriceCall hits[2][2] = {};
+		if (!FindBonusPriceCalls(code, hits))
+		{
+			OutputDebugStringA("[Dreamaker] Bonus horse price bytecode not recognized.\n");
+			return;
+		}
+
+		for (unsigned horse = 0; horse < 2; ++horse)
+		{
+			if (!price[horse]) continue;
+			uint32_t changed = 0;
+			for (; changed < 2; ++changed)
+			{
+				if (!WritePriceMultiplier(pages.data(), size, hits[horse][changed], false))
+					break;
+			}
+			if (changed == 2) continue;
+			while (changed > 0)
+				WritePriceMultiplier(pages.data(), size, hits[horse][--changed], true);
+			OutputDebugStringA("[Dreamaker] Could not apply bonus horse price.\n");
+		}
+	}
+
 	static int TryPatch(GetScrProgramFn getProgram, uint32_t hash)
 	{
 		__try
@@ -6710,6 +7648,8 @@ namespace StoryHorseRename
 
 		static const uint32_t hash = Joaat("shop_horse_shop_sp");
 		TryPatch(fn, hash);
+		if (!NETWORK::NETWORK_IS_SESSION_ACTIVE() && !NETWORK::NETWORK_IS_GAME_IN_PROGRESS())
+			TryBonusPricePatch(fn, hash);
 	}
 }
 

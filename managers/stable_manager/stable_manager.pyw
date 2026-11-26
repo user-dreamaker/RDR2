@@ -99,6 +99,11 @@ HORSE_HASHES = {
     "0xA06225BC": "Turkoman (Silver)",
 }
 
+BONUS_HORSE_KEYS = {
+    "0X642DA5B7",  # Thoroughbred Reverse Dapple Black
+    "0XDAF88C3F",  # Ardennes Iron Grey Roan
+}
+
 HASH_TO_NAME = {}
 for h, n in HORSE_HASHES.items():
     HASH_TO_NAME[h.upper()] = n
@@ -298,39 +303,66 @@ class CatalogEditor:
                         return True
         return False
 
-    def get_price(self, item_node):
-        n4f = item_node.get_child_by_name('UNK_MEMBER_0x4F728F50')
-        if n4f is None:
-            return ""
-        for item in n4f.get_children_by_name('Item'):
-            c538 = item.get_child_by_name('UNK_MEMBER_0xC53812FF')
-            if c538 is None:
+    def _cash_price_node(self, item_node):
+        costs = item_node.get_child_by_name('UNK_MEMBER_0x4F728F50')
+        if costs is None:
+            return None
+        is_bonus = item_node.get_attr('key', '').upper() in BONUS_HORSE_KEYS
+        for cost in costs.get_children_by_name('Item'):
+            if is_bonus and self._get_node_text(cost, 'UNK_MEMBER_0xE9806307').upper() != '0XC96FEC6B':
                 continue
-            for pi in c538.get_children_by_name('Item'):
-                value_node = pi.get_child_by_name('UNK_MEMBER_0x9EA8B8F4')
-                if value_node is not None:
-                    return value_node.get_attr('value', '')
-                if 'value' in pi.attributes:
-                    return pi.get_attr('value', '')
-        return ""
+            items = cost.get_child_by_name('UNK_MEMBER_0xC53812FF')
+            if items is None:
+                continue
+            for payment in items.get_children_by_name('Item'):
+                if is_bonus and self._get_node_text(payment, 'UNK_MEMBER_0xD3B360C4').upper() != '0X7C407083':
+                    continue
+                value = payment.get_child_by_name('UNK_MEMBER_0x9EA8B8F4')
+                if value is not None:
+                    return value
+                if 'value' in payment.attributes:
+                    return payment
+        return None
+
+    def get_price(self, item_node):
+        node = self._cash_price_node(item_node)
+        return node.get_attr('value', '') if node is not None else ''
 
     def set_price(self, item_node, price_cents_str):
-        n4f = item_node.get_child_by_name('UNK_MEMBER_0x4F728F50')
-        if n4f is None:
+        node = self._cash_price_node(item_node)
+        if node is not None:
+            node.attributes['value'] = price_cents_str
+            return True
+        if item_node.get_attr('key', '').upper() not in BONUS_HORSE_KEYS:
             return False
-        for item in n4f.get_children_by_name('Item'):
-            c538 = item.get_child_by_name('UNK_MEMBER_0xC53812FF')
-            if c538 is None:
-                continue
-            for pi in c538.get_children_by_name('Item'):
-                value_node = pi.get_child_by_name('UNK_MEMBER_0x9EA8B8F4')
-                if value_node is not None:
-                    value_node.attributes['value'] = price_cents_str
-                    return True
-                if 'value' in pi.attributes:
-                    pi.attributes['value'] = price_cents_str
-                    return True
-        return False
+        if price_cents_str == '0':
+            return True
+
+        costs = item_node.get_child_by_name('UNK_MEMBER_0x4F728F50')
+        if costs is None:
+            costs = YMTNode('UNK_MEMBER_0x4F728F50')
+            sellprices = item_node.get_child_by_name('UNK_MEMBER_0x1B8108CB')
+            if sellprices is None:
+                return False
+            costs.parent = item_node
+            item_node.children.insert(item_node.children.index(sellprices), costs)
+        if any(self._get_node_text(cost, 'UNK_MEMBER_0xE9806307').upper() == '0XC96FEC6B'
+               for cost in costs.get_children_by_name('Item')):
+            return False
+
+        cost = YMTNode('Item')
+        cost.add_child(YMTNode('UNK_MEMBER_0xE9806307', text='0xC96FEC6B'))
+        cost.add_child(YMTNode('UNK_MEMBER_0x9EA8B8F4', {'value': '1'}))
+        cost.add_child(YMTNode('UNK_MEMBER_0xEBB42AC3', text='0x537EE473'))
+        items = YMTNode('UNK_MEMBER_0xC53812FF')
+        payment = YMTNode('Item')
+        payment.add_child(YMTNode('UNK_MEMBER_0xD3B360C4', text='0x7C407083'))
+        payment.add_child(YMTNode('UNK_MEMBER_0x9EA8B8F4', {'value': price_cents_str}))
+        items.add_child(payment)
+        cost.add_child(items)
+        cost.add_child(YMTNode('UNK_MEMBER_0xD7010B19'))
+        costs.add_child(cost)
+        return True
 
     def _get_node_text(self, node, name):
         child = node.get_child_by_name(name)
@@ -502,13 +534,18 @@ class StableManagerApp:
                     continue
                 if hh_upper in self._by_hash:
                     _, node = self._by_hash[hh_upper]
+                    is_bonus = node.get_attr('key', '').upper() in BONUS_HORSE_KEYS
                     try:
                         dollars = int(pvar.get().strip())
-                        cents = str(dollars * 100)
-                        if not self.editor.set_price(node, cents):
-                            pass
                     except ValueError:
-                        pass
+                        if is_bonus:
+                            raise ValueError(f"Enter a whole-dollar price for {HASH_TO_NAME[hh_upper]}.")
+                        continue
+                    cents = dollars * 100
+                    if is_bonus and not 0 <= cents <= 2147483647:
+                        raise ValueError(f"Enter a price between $0 and $21474836 for {HASH_TO_NAME[hh_upper]}.")
+                    if not self.editor.set_price(node, str(cents)) and is_bonus:
+                        raise ValueError(f"Could not write the default cash price for {HASH_TO_NAME[hh_upper]}.")
 
             self.editor.save_file(self.ymt_path)
             self._load(self.ymt_path)
