@@ -18,6 +18,7 @@
 using namespace std;
 
 static void Satchel_Restore();
+static void HudScriptMain();
 static void Satchel_CancelScan();
 static bool Satchel_ReapScan();
 static bool SniperHook_Initialize();
@@ -36,6 +37,17 @@ static bool IsFaceCovered(Ped ped);
 static int SafeWorldGetAllPeds(int *arr, int n);
 static bool UnlockAllOutfits();
 
+namespace Gunsmith
+{
+	static void Tick();
+	static void Shutdown();
+}
+namespace Tailor
+{
+	static void Tick();
+	static void Shutdown();
+}
+
 extern HMODULE g_hModule;
 
 HMODULE g_hModule = nullptr;
@@ -51,6 +63,7 @@ BOOL APIENTRY DllMain(HMODULE hInstance, DWORD reason, LPVOID lpReserved)
 	case DLL_PROCESS_ATTACH:
 		g_hModule = hInstance;
 		scriptRegister(hInstance, ScriptMain);
+		scriptRegisterAdditionalThread(hInstance, HudScriptMain);
 		keyboardHandlerRegister(OnKeyboardMessage);
 		break;
 	case DLL_PROCESS_DETACH:
@@ -59,6 +72,8 @@ BOOL APIENTRY DllMain(HMODULE hInstance, DWORD reason, LPVOID lpReserved)
 			Satchel_CancelScan();
 			Satchel_ReapScan();
 			Satchel_Restore();
+			Gunsmith::Shutdown();
+			Tailor::Shutdown();
 		}
 		SniperHook_Shutdown();
 		scriptUnregister(hInstance);
@@ -98,6 +113,8 @@ int g_clear_All_Bounties_and_Lockdown_Areas = 0;
 int g_noForcedHolstering = 0;
 int g_autoRename = 0;
 int g_blanketRemover = 0;
+static bool g_gunsmithUnlocker = false;
+static bool g_tailorUnlocker = false;
 
 int g_perfectHorses = 1;
 int g_perfectHorsesHealth = 6;
@@ -888,7 +905,7 @@ static constexpr uintptr_t kSatchelRuleSize = 0x18;
 static constexpr uintptr_t kSatchelRuleValue = 0x08;
 static constexpr uintptr_t kSatchelRuleTag = 0x10;
 static constexpr size_t kSatchelScanSize = 256 * 1024;
-static constexpr size_t kSatchelHashBuckets = 1 << 12;
+static constexpr size_t kSatchelHashBuckets = 1 << 16;
 
 static std::unordered_map<uint32_t, SatchelSetting> g_satchelSettings;
 static SatchelLimits g_satchelGlobalLimits;
@@ -906,10 +923,11 @@ struct SatchelCandidate
 struct SatchelScan
 {
 	HMODULE module = nullptr;
-	volatile LONG references = 2;
+	volatile LONG references = 1;
 	volatile LONG cancelled = 0, done = 0;
 	volatile LONG head = 0, tail = 0;
 	bool global = false;
+	bool workerStarted = false;
 	vector<SatchelCandidate> cached;
 	bool hashBuckets[kSatchelHashBuckets] = {};
 	SatchelCandidate queue[kSatchelQueueSize];
@@ -1293,7 +1311,7 @@ static void Satchel_CancelScan()
 static bool Satchel_ReapScan()
 {
 	if (!g_satchelScan) return true;
-	if (!Satchel_AtomicRead(g_satchelScan->done)) return false;
+	if (g_satchelScan->workerStarted && !Satchel_AtomicRead(g_satchelScan->done)) return false;
 	Satchel_ReleaseScan(g_satchelScan);
 	g_satchelScan = nullptr;
 	return true;
@@ -1356,14 +1374,6 @@ static bool Satchel_DiscoverChunk(SatchelScan &scan, uintptr_t address, size_t s
 
 static void Satchel_Discover(SatchelScan &scan)
 {
-	for (const auto &candidate : scan.cached)
-	{
-		if (Satchel_AtomicRead(scan.cancelled)) return;
-		SatchelRecord record;
-		if (Satchel_Decode(candidate.item, candidate.hash, record) &&
-			!Satchel_SendCandidate(scan, candidate)) return;
-	}
-
 	SYSTEM_INFO system = {};
 	GetSystemInfo(&system);
 	uintptr_t address = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
@@ -1392,9 +1402,9 @@ static void Satchel_Discover(SatchelScan &scan)
 				if (!Satchel_DiscoverChunk(scan, address, size, available)) return;
 				address += size;
 				bytesSinceYield += size;
-				if (bytesSinceYield >= 8 * 1024 * 1024)
+				if (bytesSinceYield >= 1024 * 1024)
 				{
-					Sleep(1);
+					Sleep(2);
 					bytesSinceYield = 0;
 				}
 			}
@@ -1443,22 +1453,28 @@ static void Satchel_StartScan()
 		scan->hashBuckets[entry.first & (kSatchelHashBuckets - 1)] = true;
 	}
 	g_satchelRemaining = g_satchelSettings.size();
+	g_satchelScan = scan;
+}
+
+static bool Satchel_StartDiscovery(SatchelScan &scan)
+{
 	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-		reinterpret_cast<LPCWSTR>(&Satchel_DiscoveryWorker), &scan->module))
-	{
-		delete scan;
-		return;
-	}
-	const HANDLE worker = CreateThread(nullptr, 0, Satchel_DiscoveryWorker, scan, 0, nullptr);
+		reinterpret_cast<LPCWSTR>(&Satchel_DiscoveryWorker), &scan.module))
+		return false;
+
+	scan.workerStarted = true;
+	InterlockedExchange(&scan.references, 2);
+	const HANDLE worker = CreateThread(nullptr, 0, Satchel_DiscoveryWorker, &scan, 0, nullptr);
 	if (!worker)
 	{
-		FreeLibrary(scan->module);
-		delete scan;
+		scan.workerStarted = false;
+		InterlockedExchange(&scan.references, 1);
+		FreeLibrary(scan.module);
 		Satchel_Log("Could not start item discovery.");
-		return;
+		return false;
 	}
 	CloseHandle(worker);
-	g_satchelScan = scan;
+	return true;
 }
 
 static bool Satchel_BudgetExpired(LONGLONG deadline)
@@ -1470,6 +1486,7 @@ static bool Satchel_BudgetExpired(LONGLONG deadline)
 struct SatchelTrimInventory
 {
 	alignas(8) Any characterGuid[8] = {};
+	bool checked = false;
 	bool ready = false;
 };
 
@@ -1477,6 +1494,8 @@ static constexpr int kSatchelStoryInventory = 1;
 
 static void Satchel_ReadTrimInventory(SatchelTrimInventory &inventory)
 {
+	if (inventory.checked) return;
+	inventory.checked = true;
 	if (ITEMS::_0x7C7E4AB748EA3B07()) return;
 	static const uint32_t character = Joaat("CHARACTER");
 	static const uint32_t rootSlot = Joaat("SLOTID_NONE");
@@ -1531,6 +1550,7 @@ static void Satchel_ApplyCandidate(const SatchelCandidate &candidate, SatchelTri
 	const int capacity = Satchel_Apply(hash, record, limits);
 	if (!capacity) return;
 	g_satchelCachedItems[hash] = candidate.item;
+	Satchel_ReadTrimInventory(inventory);
 	if (inventory.ready)
 		Satchel_TrimExcess(hash, capacity, inventory);
 	else
@@ -1597,7 +1617,7 @@ static void Satchel_Tick()
 	static const LONGLONG budget = []() -> LONGLONG
 	{
 		LARGE_INTEGER frequency = {};
-		return QueryPerformanceFrequency(&frequency) ? frequency.QuadPart / 2000 : 0;
+		return QueryPerformanceFrequency(&frequency) ? frequency.QuadPart / 3000 : 0;
 	}();
 	LARGE_INTEGER start = {};
 	QueryPerformanceCounter(&start);
@@ -1611,16 +1631,16 @@ static void Satchel_Tick()
 		while (!g_satchelEdits.empty())
 		{
 			Satchel_RestoreLastEdit();
-			if (++restored == 32 || Satchel_BudgetExpired(deadline)) return;
+			if (++restored == 16 || Satchel_BudgetExpired(deadline)) return;
 		}
 		g_satchelWasPlaying = true;
 		Satchel_StartScan();
 	}
 	SatchelTrimInventory inventory;
-	if (g_satchelScan || !g_satchelPendingTrim.empty()) Satchel_ReadTrimInventory(inventory);
+	if (!g_satchelPendingTrim.empty()) Satchel_ReadTrimInventory(inventory);
 	if (!g_satchelPendingTrim.empty() && inventory.ready)
 	{
-		for (unsigned i = 0; i < 8 && !g_satchelPendingTrim.empty(); ++i)
+		for (unsigned i = 0; i < 4 && !g_satchelPendingTrim.empty(); ++i)
 		{
 			Satchel_TrimDeferred(g_satchelPendingTrim.back(), inventory);
 			g_satchelPendingTrim.pop_back();
@@ -1637,7 +1657,23 @@ static void Satchel_Tick()
 	auto &scan = *g_satchelScan;
 	SatchelCandidate candidate;
 	unsigned processed = 0;
-	while ((scan.global || g_satchelRemaining) && processed < 16 && Satchel_TakeCandidate(scan, candidate))
+	while (!scan.cached.empty() && (scan.global || g_satchelRemaining))
+	{
+		candidate = scan.cached.back();
+		scan.cached.pop_back();
+		Satchel_ApplyCandidate(candidate, inventory);
+		if (++processed == 8 || Satchel_BudgetExpired(deadline)) return;
+	}
+
+	if (!scan.workerStarted)
+	{
+		if (!scan.global && !g_satchelRemaining)
+			InterlockedExchange(&scan.done, 1);
+		else if (!Satchel_StartDiscovery(scan))
+			InterlockedExchange(&scan.done, 1);
+	}
+
+	while ((scan.global || g_satchelRemaining) && processed < 8 && Satchel_TakeCandidate(scan, candidate))
 	{
 		Satchel_ApplyCandidate(candidate, inventory);
 		++processed;
@@ -1645,9 +1681,14 @@ static void Satchel_Tick()
 	}
 
 	if (!scan.global && !g_satchelRemaining) Satchel_CancelScan();
-	if (!Satchel_AtomicRead(scan.done) ||
-		((scan.global || g_satchelRemaining) && Satchel_AtomicRead(scan.head) != Satchel_AtomicRead(scan.tail)))
+	const bool done = Satchel_AtomicRead(scan.done) != 0;
+	const bool queueEmpty = Satchel_AtomicRead(scan.head) == Satchel_AtomicRead(scan.tail);
+	if (!done)
+	{
+		if (queueEmpty && g_satchelPendingTrim.empty()) g_satchelNextPoll = now + 16;
 		return;
+	}
+	if ((scan.global || g_satchelRemaining) && !queueEmpty) return;
 
 	Satchel_ReapScan();
 	g_satchelNextPoll = now + 250;
@@ -1667,6 +1708,8 @@ static void LoadConfig()
 {
 	string iniPath = GetIniPath();
 	Satchel_LoadConfig(iniPath);
+	g_gunsmithUnlocker = GetPrivateProfileIntA("Config", "Gunsmith_Unlocker", 0, iniPath.c_str()) == 1;
+	g_tailorUnlocker = GetPrivateProfileIntA("Config", "Tailor_Unlocker", 0, iniPath.c_str()) == 1;
 
 	if (GetFileAttributesA(iniPath.c_str()) == INVALID_FILE_ATTRIBUTES)
 		return;
@@ -2893,6 +2936,26 @@ void ProcessMarkerToggle()
 	SetMarkerBlipsVisible(g_markersVisible);
 }
 
+struct CheatProximity
+{
+	Ped player = 0;
+	DWORD nextCheck = 0;
+	bool nearby = false;
+
+	bool Check(bool (*findNearby)())
+	{
+		const Ped current = PLAYER::PLAYER_PED_ID();
+		const DWORD now = GetTickCount();
+		if (current != player || static_cast<LONG>(now - nextCheck) >= 0)
+		{
+			player = current;
+			nextCheck = now + 100;
+			nearby = findNearby();
+		}
+		return nearby;
+	}
+};
+
 void main()
 {
 	LoadConfig();
@@ -2904,6 +2967,7 @@ void main()
 		SniperHook_Initialize();
 
 	auto menuController = new MenuController();
+	CheatProximity bankProximity, outfitProximity;
 
 	while (true)
 	{
@@ -2920,6 +2984,8 @@ void main()
 				ClearMarkerBlips();
 
 				LoadConfig();
+				bankProximity = {};
+				outfitProximity = {};
 
 				g_menuWidthCalculated = false;
 				g_spawnsDone = false;
@@ -2938,8 +3004,7 @@ void main()
 
 		if (!g_bankPhrases.empty())
 		{
-			Ped playerPed = PLAYER::PLAYER_PED_ID();
-			bool nearBank = ENTITY::DOES_ENTITY_EXIST(playerPed) && IsPlayerNearBank();
+			const bool nearBank = bankProximity.Check(IsPlayerNearBank);
 
 			switch (g_bankState)
 			{
@@ -2975,7 +3040,6 @@ void main()
 		case GB_KEYBOARD:
 			{
 				if (g_outfitState == OUTFITS_KEYBOARD) break;
-				CONTROLS::DISABLE_ALL_CONTROL_ACTIONS(0);
 				if (GetTickCount() - g_kbOpenTick < 300) break;
 
 				bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
@@ -3192,8 +3256,7 @@ void main()
 
 		if (!g_outfitPhrases.empty())
 		{
-			Ped playerPed = PLAYER::PLAYER_PED_ID();
-			bool nearNpc = ENTITY::DOES_ENTITY_EXIST(playerPed) && IsPlayerNearOutfitNpc();
+			const bool nearNpc = outfitProximity.Check(IsPlayerNearOutfitNpc);
 
 			switch (g_outfitState)
 			{
@@ -3228,7 +3291,6 @@ void main()
 
 			case OUTFITS_KEYBOARD:
 			{
-				CONTROLS::DISABLE_ALL_CONTROL_ACTIONS(0);
 				if (GetTickCount() - g_kbOpenTick < 300) break;
 
 				bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
@@ -3835,37 +3897,6 @@ void main()
 			}
 		}
 
-		if (g_fps != 0)
-		{
-			static DWORD fpsLastTick = GetTickCount();
-			static int fpsFrames = 0;
-			static float fpsValue = 0.0f;
-			DWORD now = GetTickCount();
-			fpsFrames++;
-			if (now - fpsLastTick >= 500)
-			{
-				fpsValue = (float)fpsFrames * 1000.0f / (float)(now - fpsLastTick);
-				fpsFrames = 0;
-				fpsLastTick = now;
-			}
-			char fpsBuf[32];
-			sprintf_s(fpsBuf, "FPS: %.0f", fpsValue);
-			UI::SET_TEXT_SCALE(0.0, 0.24f);
-			if (g_fps >= 2)
-			{
-				if (fpsValue >= 60.0f)      UI::SET_TEXT_COLOR_RGBA(255, 255, 255, 255);
-				else if (fpsValue >= 30.0f) UI::SET_TEXT_COLOR_RGBA(255, 255, 0, 255);
-				else                        UI::SET_TEXT_COLOR_RGBA(255, 0, 0, 255);
-			}
-			else
-			{
-				UI::SET_TEXT_COLOR_RGBA(255, 255, 255, 255);
-			}
-			UI::SET_TEXT_DROPSHADOW(2, 0, 0, 0, 0);
-			UI::SET_TEXT_CENTRE(0);
-			DrawText(0.01f, 0.01f, fpsBuf);
-		}
-
 		if (g_gps != 0)
 		{
 			Ped playerPed = PLAYER::PLAYER_PED_ID();
@@ -3940,6 +3971,62 @@ void main()
 				}
 			}
 		}
+
+		menuController->Update();
+
+		{
+			int _si = GetStableAtPlayerPos();
+			OnlineHorses_Tick(_si >= 0);
+		}
+
+		BlanketRemover_Tick();
+		StoryHorseRename_Tick();
+		Satchel_Tick();
+		Gunsmith::Tick();
+		Tailor::Tick();
+
+		WAIT(0);
+	}
+}
+
+static void HudScriptMain()
+{
+	while (true)
+	{
+		if (g_bankState == GB_KEYBOARD || g_outfitState == OUTFITS_KEYBOARD)
+			CONTROLS::DISABLE_ALL_CONTROL_ACTIONS(0);
+
+		if (g_fps != 0)
+		{
+			static DWORD fpsLastTick = GetTickCount();
+			static int fpsFrames = 0;
+			static float fpsValue = 0.0f;
+			static char fpsBuf[32] = "FPS: 0";
+			DWORD now = GetTickCount();
+			fpsFrames++;
+			if (now - fpsLastTick >= 500)
+			{
+				fpsValue = (float)fpsFrames * 1000.0f / (float)(now - fpsLastTick);
+				fpsFrames = 0;
+				fpsLastTick = now;
+				sprintf_s(fpsBuf, "FPS: %.0f", fpsValue);
+			}
+			UI::SET_TEXT_SCALE(0.0, 0.24f);
+			if (g_fps >= 2)
+			{
+				if (fpsValue >= 60.0f)      UI::SET_TEXT_COLOR_RGBA(255, 255, 255, 255);
+				else if (fpsValue >= 30.0f) UI::SET_TEXT_COLOR_RGBA(255, 255, 0, 255);
+				else                        UI::SET_TEXT_COLOR_RGBA(255, 0, 0, 255);
+			}
+			else
+			{
+				UI::SET_TEXT_COLOR_RGBA(255, 255, 255, 255);
+			}
+			UI::SET_TEXT_DROPSHADOW(2, 0, 0, 0, 0);
+			UI::SET_TEXT_CENTRE(0);
+			DrawText(0.01f, 0.01f, fpsBuf);
+		}
+
 
 		if (!g_bankPhrases.empty())
 		{
@@ -4026,17 +4113,6 @@ void main()
 				DrawText(0.5f, 0.90f, "!!!");
 			}
 		}
-
-		menuController->Update();
-
-		{
-			int _si = GetStableAtPlayerPos();
-			OnlineHorses_Tick(_si >= 0);
-		}
-
-		BlanketRemover_Tick();
-		StoryHorseRename_Tick();
-		Satchel_Tick();
 
 		WAIT(0);
 	}
@@ -4904,21 +4980,22 @@ static void SniperHook_SetDisguised(bool disguised)
 	g_disguised = disguised;
 }
 
-static bool SniperHook_Initialize()
+static GetNativeHandlerFn ResolveNativeHandlerLookup()
 {
 	HMODULE gameModule = GetModuleHandle(NULL);
-	if (!gameModule)
-		return false;
+	if (!gameModule) return nullptr;
 
 	uintptr_t callSite = PatternScan(gameModule, "E8 ?? ?? ?? ?? 42 8B 9C FE");
-	if (!callSite)
-		return false;
+	if (!callSite) return nullptr;
 
 	int32_t relOffset = 0;
 	memcpy(&relOffset, reinterpret_cast<const void*>(callSite + 1), sizeof(relOffset));
-	uintptr_t getNativeHandlerAddr = callSite + 5 + static_cast<intptr_t>(relOffset);
+	return reinterpret_cast<GetNativeHandlerFn>(callSite + 5 + static_cast<intptr_t>(relOffset));
+}
 
-	g_GetNativeHandler = (GetNativeHandlerFn)getNativeHandlerAddr;
+static bool SniperHook_Initialize()
+{
+	g_GetNativeHandler = ResolveNativeHandlerLookup();
 	if (!g_GetNativeHandler)
 		return false;
 
@@ -5002,10 +5079,17 @@ static SlotInfo ReadSlot(int slot)
 }
 static bool WritePair(int slot, uint32_t breed, uint32_t model)
 {
-	if (!WrG(GIdx(slot, kFBreed), breed)) return false;
-	if (!WrG(GIdx(slot, kFModel), model)) return false;
-	SlotInfo r = ReadSlot(slot);
-	return r.ok && r.breed == breed && r.model == model;
+	const SlotInfo previous = ReadSlot(slot);
+	if (!previous.ok || !previous.state) return false;
+	if (previous.breed == breed && previous.model == model) return true;
+	if (WrG(GIdx(slot, kFBreed), breed) && WrG(GIdx(slot, kFModel), model))
+	{
+		const SlotInfo current = ReadSlot(slot);
+		if (current.ok && current.breed == breed && current.model == model) return true;
+	}
+	WrG(GIdx(slot, kFBreed), previous.breed);
+	WrG(GIdx(slot, kFModel), previous.model);
+	return false;
 }
 
 static uint32_t Joaat(const char *s)
@@ -5103,10 +5187,20 @@ static const OnlineModel *FindOnline(uint32_t model)
 	return nullptr;
 }
 
-struct MapEntry { bool valid; uint32_t realBreed, realModel; int ownerSlot; };
+struct MapEntry
+{
+	bool valid = false;
+	uint32_t realBreed = 0, realModel = 0;
+	int ownerSlot = -1;
+	uint32_t gender = 0;
+	string name;
+	Ped ped = 0;
+};
 static MapEntry g_map[F_COUNT];
 
 static int DonorOfPair(uint32_t breed, uint32_t model);
+static Ped SlotPed(int slot);
+static bool g_donorMode = false;
 
 static string BreedSuffix(const string &modelName)
 {
@@ -5229,79 +5323,485 @@ static void RenameNewlyAcquired()
 	}
 }
 
-static bool DonorModelOwnedByRealHorse(int d)
+struct SavedOnlineHorse
 {
-	for (int i = 0; i < kSlots; i++)
+	int donor;
+	uint32_t breed, model, gender;
+	string name;
+	bool current = false;
+};
+
+static constexpr char kOnlineHorseSection[] = "Stall";
+static constexpr char kLegacyHorseSection[] = "OnlineHorseRecovery";
+static vector<SavedOnlineHorse> g_savedOnlineHorses;
+
+static constexpr char kHorseHex[] = "0123456789ABCDEF";
+
+static void AppendHorseHex(string &out, unsigned char ch)
+{
+	out += kHorseHex[ch >> 4];
+	out += kHorseHex[ch & 15];
+}
+
+static bool ReadHorseHex(const string &text, size_t offset, char &out)
+{
+	if (offset + 2 > text.size()) return false;
+	const char *high = strchr(kHorseHex, toupper(static_cast<unsigned char>(text[offset])));
+	const char *low = strchr(kHorseHex, toupper(static_cast<unsigned char>(text[offset + 1])));
+	if (!high || !low || !*high || !*low) return false;
+	out = static_cast<char>((high - kHorseHex) * 16 + (low - kHorseHex));
+	return out != '\0';
+}
+
+static string EncodeStallName(const string &name)
+{
+	string out;
+	for (size_t i = 0; i < name.size(); ++i)
 	{
-		SlotInfo s = ReadSlot(i);
-		if (s.ok && s.state != 0 && s.model == kDonors[d].model && s.breed != kDonors[d].breed) return true;
+		const unsigned char ch = static_cast<unsigned char>(name[i]);
+		if (ch < 32 || ch > 126 || ch == '%' || ch == '|' || ch == ';' || ch == '#' || ch == '"' ||
+			(ch == ' ' && (i == 0 || i == name.size() - 1)))
+		{
+			out += '%';
+			AppendHorseHex(out, ch);
+		}
+		else out += ch;
 	}
+	return out;
+}
+
+static bool DecodeStallNames(const string &value, vector<string> &names)
+{
+	for (size_t start = 0;;)
+	{
+		const size_t end = value.find('|', start);
+		const string text = Trim(value.substr(start, end == string::npos ? end : end - start));
+		string name;
+		for (size_t i = 0; i < text.size(); ++i)
+		{
+			char ch = text[i];
+			if (ch == '%')
+			{
+				if (!ReadHorseHex(text, i + 1, ch)) return false;
+				i += 2;
+			}
+			name += ch;
+		}
+		if (name.empty() || name.size() > 63) return false;
+		names.push_back(std::move(name));
+		if (end == string::npos) return true;
+		start = end + 1;
+	}
+}
+
+static string StallHorseKey(const SavedOnlineHorse &entry)
+{
+	ostringstream key;
+	if (entry.gender <= 1)
+		key << "Donor_" << (entry.donor + 1) << '_' << (entry.gender == 1 ? 'M' : 'F');
+	else
+		key << "Horse_" << entry.donor << '_' << entry.gender;
+	key << '_' << uppercase << hex << entry.breed << (entry.gender <= 1 ? '-' : '_') << entry.model;
+	return key.str();
+}
+
+static bool ValidStallHorse(const SavedOnlineHorse &entry)
+{
+	return entry.donor >= 0 && entry.donor < F_COUNT && entry.breed && FindOnline(entry.model);
+}
+
+static bool ReadStallKey(const string &key, bool numericGender, int indexBase, bool currentKey,
+	SavedOnlineHorse &entry)
+{
+	string fields = key.substr(6);
+	for (char &ch : fields)
+		if (ch == '_' || (currentKey && ch == '-')) ch = ' ';
+	istringstream row(fields);
+	if (!(row >> entry.donor) || entry.donor < indexBase) return false;
+	entry.donor -= indexBase;
+	if (numericGender)
+	{
+		if (!(row >> entry.gender)) return false;
+	}
+	else
+	{
+		string gender;
+		if (!(row >> gender)) return false;
+		if (_stricmp(gender.c_str(), "M") == 0) entry.gender = 1;
+		else if (_stricmp(gender.c_str(), "F") == 0) entry.gender = 0;
+		else return false;
+	}
+	if (!(row >> hex >> entry.breed >> entry.model)) return false;
+	row >> ws;
+	return row.eof() && ValidStallHorse(entry) &&
+		(!currentKey || _stricmp(key.c_str(), StallHorseKey(entry).c_str()) == 0);
+}
+
+static const SavedOnlineHorse *FindSavedOnlineHorse(int donor, uint32_t gender, const string &name)
+{
+	for (const auto &entry : g_savedOnlineHorses)
+		if (entry.donor == donor && entry.gender == gender && SameName(entry.name, name))
+			return &entry;
+	return nullptr;
+}
+
+static bool SameStallRecord(const SavedOnlineHorse &a, const SavedOnlineHorse &b)
+{
+	return a.donor == b.donor && a.gender == b.gender && a.breed == b.breed && a.model == b.model;
+}
+
+static bool HasCurrentStallRecord(const SavedOnlineHorse &entry)
+{
+	for (const auto &saved : g_savedOnlineHorses)
+		if (saved.current && SameStallRecord(saved, entry)) return true;
 	return false;
 }
 
-static bool DonorInUse(int d, int exceptSlot)
+static bool ReadHorseIniSection(const string &ini, const char *name, vector<char> &section)
 {
-	for (int i = 0; i < kSlots; i++)
+	section.resize(4096);
+	for (;;)
 	{
-		if (i == exceptSlot) continue;
-		SlotInfo s = ReadSlot(i);
-		if (s.ok && s.state != 0 && s.breed == kDonors[d].breed && s.model == kDonors[d].model) return true;
+		const DWORD size = static_cast<DWORD>(section.size());
+		if (GetPrivateProfileSectionA(name, section.data(), size, ini.c_str()) < size - 2)
+			return true;
+		if (section.size() >= 1024 * 1024) return false;
+		section.resize(section.size() * 2);
 	}
-	return false;
 }
 
-static void PreserveOnlineHorseNickname(int slot, const OnlineModel &om)
+static constexpr char kStallDonorIndexKey[] = "DonorIndexBase";
+
+static const char *CoatLabelFor(const string &modelName);
+
+static string StallBreedAndCoat(uint32_t model)
 {
-	string current = ReadName(slot);
-	if (!current.empty()) return;
-	string correctName = LocalizedBreedName(BreedSuffix(om.name));
-	if (!correctName.empty()) WriteNameForce(slot, correctName);
+	const auto *online = FindOnline(model);
+	if (!online) return {};
+	const string breedKey = BreedSuffix(online->name);
+	const size_t prefixSize = sizeof("A_C_HORSE_") - 1;
+	const size_t coatStart = online->name.find('_', prefixSize);
+	const char *label = CoatLabelFor(online->name);
+	string breed = LocalizedBreedName(breedKey);
+	if (breed.empty()) breed = breedKey;
+	string coat;
+	if (label && invoke<BOOL>(0x73C258C68D6F55B6ull, label) != FALSE)
+		coat = TrimText(invoke<const char *>(0xCFEDCCAD3C5BA90Dull, label));
+	if (coat.empty() && coatStart != string::npos) coat = online->name.substr(coatStart + 1);
+	return EncodeStallName(breed + " (" + coat + ")");
+}
+
+static bool MergeOldStallAliases(const SavedOnlineHorse &entry, const string &path)
+{
+	const string key = StallHorseKey(entry);
+	vector<char> current(256);
+	for (;;)
+	{
+		const DWORD size = static_cast<DWORD>(current.size());
+		if (GetPrivateProfileStringA(kOnlineHorseSection, key.c_str(), "", current.data(), size, path.c_str()) < size - 1)
+			break;
+		if (current.size() >= 1024 * 1024) return false;
+		current.resize(current.size() * 2);
+	}
+
+	const string stored(current.data());
+	const size_t label = stored.find('#');
+	string value = Trim(stored.substr(0, label));
+	vector<string> names;
+	if (!value.empty() && !DecodeStallNames(value, names)) return false;
+	bool known = false;
+	for (const auto &name : names)
+		if (SameName(name, entry.name)) { known = true; break; }
+
+	if (!known)
+	{
+		if (!value.empty()) value += " | ";
+		value += EncodeStallName(entry.name);
+	}
+
+	if (value == stored) return true;
+	return WritePrivateProfileStringA(kOnlineHorseSection, key.c_str(), value.c_str(), path.c_str()) != 0;
+}
+
+static bool ReadLegacyHorse(const string &key, const char *value, SavedOnlineHorse &entry)
+{
+	istringstream row(value);
+	string encoded;
+	if (!(row >> entry.donor >> hex >> entry.breed >> entry.model >> entry.gender >> encoded) ||
+		!ValidStallHorse(entry) || encoded.empty() || encoded.size() > 126 || encoded.size() % 2)
+		return false;
+	row >> ws;
+	if (!row.eof()) return false;
+
+	string oldKey = "Horse_" + to_string(entry.donor) + "_" + to_string(entry.gender) + "_";
+	for (size_t i = 0; i < encoded.size(); i += 2)
+	{
+		char ch;
+		if (!ReadHorseHex(encoded, i, ch)) return false;
+		entry.name += ch;
+		AppendHorseHex(oldKey, static_cast<unsigned char>(tolower(static_cast<unsigned char>(ch))));
+	}
+	return _stricmp(key.c_str(), oldKey.c_str()) == 0;
+}
+
+static void MigrateOnlineHorseRecords(const string &ini, const vector<char> &legacy)
+{
+	bool allMigrated = true;
+	for (const char *line = legacy.data(); *line; line += strlen(line) + 1)
+	{
+		const char *separator = strchr(line, '=');
+		SavedOnlineHorse entry = {};
+		if (!separator || !ReadLegacyHorse(string(line, separator), separator + 1, entry))
+		{
+			allMigrated = false;
+			continue;
+		}
+		if (HasCurrentStallRecord(entry)) continue;
+		if (const auto *saved = FindSavedOnlineHorse(entry.donor, entry.gender, entry.name))
+		{
+			if (!SameStallRecord(*saved, entry)) allMigrated = false;
+			continue;
+		}
+		if (!MergeOldStallAliases(entry, ini)) allMigrated = false;
+		g_savedOnlineHorses.push_back(std::move(entry));
+	}
+	if (allMigrated && legacy[0])
+		WritePrivateProfileStringA(kLegacyHorseSection, nullptr, nullptr, ini.c_str());
+}
+
+enum class StallKeyFormat { Current, Donor, Pending, Horse };
+
+static bool LoadStallRecords(const string &ini, const vector<char> &section, StallKeyFormat format, int indexBase)
+{
+	const bool numericGender = format == StallKeyFormat::Horse;
+	const bool pending = format == StallKeyFormat::Pending;
+	const bool currentKey = format == StallKeyFormat::Current;
+	const char *prefix = numericGender ? "Horse_" : pending ? "Pending_Donor_" : "Donor_";
+	const size_t prefixSize = strlen(prefix);
+	bool allMigrated = true;
+	for (const char *line = section.data(); *line; line += strlen(line) + 1)
+	{
+		const char *separator = strchr(line, '=');
+		if (!separator || static_cast<size_t>(separator - line) < prefixSize ||
+			_strnicmp(line, prefix, prefixSize) != 0) continue;
+		const string key(line, separator);
+		const string recordKey = pending ? key.substr(sizeof("Pending_") - 1) : key;
+		if (!numericGender && (recordKey.find('-') != string::npos) != currentKey) continue;
+
+		SavedOnlineHorse entry = {};
+		vector<string> names;
+		const string value(separator + 1);
+		if (!ReadStallKey(recordKey, numericGender, indexBase, currentKey, entry))
+		{
+			allMigrated = false;
+			continue;
+		}
+		const size_t label = value.find('#');
+		const bool supportsCurrentValue = currentKey || (numericGender && entry.gender > 1);
+		const string prefix = supportsCurrentValue && label == string::npos ? StallBreedAndCoat(entry.model) + " | " : string();
+		entry.current = !prefix.empty() && value.compare(0, prefix.size(), prefix) == 0 &&
+			value.find('|', prefix.size()) == string::npos;
+		if (!DecodeStallNames(entry.current ? value.substr(prefix.size()) : value.substr(0, label), names))
+		{
+			allMigrated = false;
+			continue;
+		}
+		const bool renameKey = !currentKey && entry.gender <= 1;
+		bool migrated = renameKey;
+		const bool alreadyCurrent = !currentKey && HasCurrentStallRecord(entry);
+		for (const auto &name : names)
+		{
+			if (alreadyCurrent) break;
+			const auto *saved = FindSavedOnlineHorse(entry.donor, entry.gender, name);
+			if (saved && !SameStallRecord(*saved, entry))
+			{
+				migrated = false;
+				continue;
+			}
+			entry.name = name;
+			if (renameKey && !MergeOldStallAliases(entry, ini)) migrated = false;
+			if (!saved) g_savedOnlineHorses.push_back(entry);
+		}
+		if (renameKey && (!migrated || !WritePrivateProfileStringA(kOnlineHorseSection, key.c_str(), nullptr, ini.c_str())))
+			allMigrated = false;
+	}
+	return allMigrated;
+}
+
+static bool LoadOnlineHorseMap()
+{
+	static bool loaded = false;
+	if (loaded) return true;
+	const string ini = GetIniPath();
+	vector<char> section, legacy;
+	if (!ReadHorseIniSection(ini, kOnlineHorseSection, section) ||
+		!ReadHorseIniSection(ini, kLegacyHorseSection, legacy)) return false;
+
+	char oldIndex[16] = {};
+	GetPrivateProfileStringA(kOnlineHorseSection, kStallDonorIndexKey, "", oldIndex, sizeof(oldIndex), ini.c_str());
+	LoadStallRecords(ini, section, StallKeyFormat::Current, 1);
+	const bool donorsMigrated = LoadStallRecords(ini, section, StallKeyFormat::Donor, strcmp(oldIndex, "1") == 0 ? 1 : 0);
+	const bool pendingMigrated = LoadStallRecords(ini, section, StallKeyFormat::Pending, 0);
+	if (oldIndex[0] && donorsMigrated && pendingMigrated)
+		WritePrivateProfileStringA(kOnlineHorseSection, kStallDonorIndexKey, nullptr, ini.c_str());
+
+	LoadStallRecords(ini, section, StallKeyFormat::Horse, 0);
+	MigrateOnlineHorseRecords(ini, legacy);
+	loaded = true;
+	return true;
+}
+
+static bool SaveOnlineHorseMapping(SavedOnlineHorse entry)
+{
+	if (!LoadOnlineHorseMap() || entry.name.empty() || entry.name.size() > 63) return false;
+	if (const auto *saved = FindSavedOnlineHorse(entry.donor, entry.gender, entry.name))
+	{
+		if (!SameStallRecord(*saved, entry)) return false;
+		if (saved->current && saved->name == entry.name) return true;
+	}
+	const string key = StallHorseKey(entry);
+	const string value = StallBreedAndCoat(entry.model) + " | " + EncodeStallName(entry.name);
+	const string ini = GetIniPath();
+	if (!WritePrivateProfileStringA(kOnlineHorseSection, key.c_str(), value.c_str(), ini.c_str()))
+	{
+		OutputDebugStringA("[Dreamaker] Could not save online horse mapping in the INI.\n");
+		return false;
+	}
+	for (auto it = g_savedOnlineHorses.begin(); it != g_savedOnlineHorses.end();)
+	{
+		if (SameStallRecord(*it, entry)) it = g_savedOnlineHorses.erase(it);
+		else ++it;
+	}
+	entry.current = true;
+	g_savedOnlineHorses.push_back(std::move(entry));
+	return true;
+}
+
+static bool MapOnlineDonors(const SlotInfo (&slots)[kSlots])
+{
+	int holder[F_COUNT];
+	for (int &slot : holder) slot = -1;
+	for (int i = 0; i < kSlots; ++i)
+	{
+		if (!slots[i].ok) return false;
+		if (!slots[i].state) continue;
+		const int donor = DonorOfPair(slots[i].breed, slots[i].model);
+		if (donor >= 0) holder[donor] = holder[donor] == -1 ? i : -2;
+	}
+
+	for (int donor = 0; donor < F_COUNT; ++donor)
+	{
+		const int i = holder[donor];
+		if (i == -1) continue;
+		MapEntry &map = g_map[donor];
+		if (i < 0)
+		{
+			map = MapEntry{};
+			continue;
+		}
+		const string name = ReadName(i);
+		if (map.valid && map.gender == slots[i].gender && SameName(map.name, name))
+		{
+			map.ownerSlot = i;
+			const Ped ped = SlotPed(i);
+			if (ped) map.ped = ped;
+			SaveOnlineHorseMapping({donor, map.realBreed, map.realModel, map.gender, name});
+			continue;
+		}
+		const Ped ped = SlotPed(i);
+		if (g_donorMode && map.valid && map.ownerSlot == i && map.gender == slots[i].gender &&
+			ped && map.ped == ped && !name.empty())
+		{
+			if (SaveOnlineHorseMapping({donor, map.realBreed, map.realModel, map.gender, name}))
+			{
+				map.name = name;
+				continue;
+			}
+			if (WritePair(i, map.realBreed, map.realModel)) continue;
+		}
+		if (const auto *entry = FindSavedOnlineHorse(donor, slots[i].gender, name))
+		{
+			map = {true, entry->breed, entry->model, i, entry->gender, name, SlotPed(i)};
+			SaveOnlineHorseMapping({donor, map.realBreed, map.realModel, map.gender, name});
+			continue;
+		}
+
+		map = MapEntry{};
+	}
+	return true;
+}
+
+static bool ReadOnlineSlots(SlotInfo (&slots)[kSlots])
+{
+	for (int i = 0; i < kSlots; ++i)
+	{
+		slots[i] = ReadSlot(i);
+		if (!slots[i].ok || slots[i].state > 2) return false;
+	}
+	return true;
 }
 
 static void ConvertOnlineSlots()
 {
-	for (int i = 0; i < kSlots; i++)
+	SlotInfo slots[kSlots];
+	if (!LoadOnlineHorseMap() || !ReadOnlineSlots(slots) || !MapOnlineDonors(slots)) return;
+	bool occupied[F_COUNT] = {};
+	for (const auto &slot : slots)
 	{
-		SlotInfo s = ReadSlot(i);
-		if (!s.ok || s.state == 0) continue;
-		const OnlineModel *om = FindOnline(s.model);
-		if (!om) continue;
+		if (!slot.state) continue;
+		for (int d = 0; d < F_COUNT; ++d)
+			if (slot.model == kDonors[d].model) occupied[d] = true;
+	}
 
-		uint32_t realBreed = s.breed ? s.breed : om->breed;
+	for (int i = 0; i < kSlots; ++i)
+	{
+		const auto &slot = slots[i];
+		if (!slot.state) continue;
+		const auto *model = FindOnline(slot.model);
+		if (!model) continue;
 
-		PreserveOnlineHorseNickname(i, *om);
-
-		int pick = -1;
-		for (int d = 0; d < F_COUNT && pick < 0; d++)
-			if (g_map[d].valid && g_map[d].realModel == s.model && !DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;
-		for (int d = DONOR_1; d <= DONOR_3 && pick < 0; d++) if (!DonorInUse(d, i)) pick = d;
-		for (int d = 0; d < F_COUNT && pick < 0; d++) if (!DonorInUse(d, i) && !DonorModelOwnedByRealHorse(d)) pick = d;
-		if (pick < 0) continue;
-
-		MapEntry old = g_map[pick];
-		g_map[pick].valid = true; g_map[pick].realBreed = realBreed; g_map[pick].realModel = s.model; g_map[pick].ownerSlot = i;
-		if (!WritePair(i, kDonors[pick].breed, kDonors[pick].model))
+		string name = ReadName(i);
+		const string defaultName = DefaultHorseName();
+		if (name.empty() || (!defaultName.empty() && SameName(name, defaultName)))
 		{
-			WritePair(i, s.breed, s.model);
-			g_map[pick] = old;
+			const string label = LocalizedBreedName(BreedSuffix(model->name));
+			if (!label.empty())
+			{
+				WriteNameForce(i, label);
+				name = ReadName(i);
+			}
 		}
+		if (name.empty() || (!defaultName.empty() && SameName(name, defaultName))) continue;
+
+		const uint32_t breed = slot.breed ? slot.breed : model->breed;
+		int pick = -1;
+		for (int d = 0; d < F_COUNT; ++d)
+		{
+			if (occupied[d]) continue;
+			const auto *saved = FindSavedOnlineHorse(d, slot.gender, name);
+			if (saved && (saved->model != slot.model || saved->breed != breed)) continue;
+			if (pick < 0 || saved) pick = d;
+			if (saved) break;
+		}
+		if (pick < 0 || !SaveOnlineHorseMapping({pick, breed, slot.model, slot.gender, name})) continue;
+		if (!WritePair(i, kDonors[pick].breed, kDonors[pick].model)) continue;
+
+		occupied[pick] = true;
+		g_map[pick] = {true, breed, slot.model, i, slot.gender, name, SlotPed(i)};
 	}
 }
 
-static bool g_donorMode = false;
-
 static void ToReal()
 {
-	for (int i = 0; i < kSlots; i++)
+	SlotInfo slots[kSlots];
+	if (!ReadOnlineSlots(slots) || !MapOnlineDonors(slots)) return;
+	for (int d = 0; d < F_COUNT; ++d)
 	{
-		SlotInfo s = ReadSlot(i);
-		if (!s.ok || s.state == 0) continue;
-		int d = DonorOfPair(s.breed, s.model);
-		if (d < 0 || !g_map[d].valid || !FindOnline(g_map[d].realModel)) continue;
-		int holders = 0;
-		for (int k = 0; k < kSlots; k++) { SlotInfo t = ReadSlot(k); if (t.ok && t.state != 0 && t.breed == s.breed && t.model == s.model) holders++; }
-		if (holders != 1) continue;
-		WritePair(i, g_map[d].realBreed, g_map[d].realModel);
+		const auto &map = g_map[d];
+		if (!map.valid || map.ownerSlot < 0 || map.ownerSlot >= kSlots) continue;
+		const auto &slot = slots[map.ownerSlot];
+		if (slot.state && DonorOfPair(slot.breed, slot.model) == d)
+			WritePair(map.ownerSlot, map.realBreed, map.realModel);
 	}
 }
 
@@ -5407,7 +5907,6 @@ static void RetireDonorActiveHorse()
 	}
 }
 
-static Ped SlotPed(int slot);
 
 static void RetireMappedDonorPedsImpl()
 {
@@ -6951,6 +7450,7 @@ void OnlineHorses_Init()
 	for (const char *name : kOnlineModels)
 		g_online.push_back({ Joaat(name), BreedOf(name), name });
 
+	LoadOnlineHorseMap();
 	ToReal();
 	RenameNewlyAcquired();
 
@@ -6979,7 +7479,8 @@ void OnlineHorses_Tick(bool nearStable)
 	static DWORD lastPoll = 0;
 	DWORD now = GetTickCount();
 
-	bool pause = UI::IS_PAUSE_MENU_ACTIVE() != 0;
+	const bool pause = UI::IS_PAUSE_MENU_ACTIVE() != 0;
+	if (g_enabled && pause && g_donorMode && !DLC2::GET_IS_LOADING_SCREEN_ACTIVE()) ExitDonorMode();
 
 	if (now - lastPoll < 200)
 	{
@@ -6992,24 +7493,24 @@ void OnlineHorses_Tick(bool nearStable)
 	}
 	lastPoll = now;
 
+	if (DLC2::GET_IS_LOADING_SCREEN_ACTIVE())
+	{
+		g_donorMode = false;
+		for (auto &entry : g_map) entry = MapEntry{};
+		return;
+	}
 	OnlineHorses_Init();
 	if (!g_enabled) return;
+	if (!g_donorMode) ToReal();
 
 	RenameNewlyAcquired();
 
-	static bool first = true;
 	static DWORD calmSince = 0;
 	bool ctrlOn = PLAYER::IS_PLAYER_CONTROL_ON(PLAYER::PLAYER_ID()) != 0;
 	int approachStable = GetStableApproachAtPlayerPos(12.0f);
 	bool shopUi = StableShopUiActive() && AnyOnlineHorseOwned();
 	bool stableContext = nearStable || approachStable >= 0 || shopUi;
 	bool want = stableContext && !pause;
-	if (first)
-	{
-		first = false;
-		if (want) EnterDonorMode();
-		else ToReal();
-	}
 	if (pause)
 	{
 		calmSince = 0;
@@ -7654,3 +8155,949 @@ namespace StoryHorseRename
 }
 
 void StoryHorseRename_Tick() { StoryHorseRename::Tick(); }
+
+namespace ShopScript
+{
+	using StoryHorseRename::GetScrProgramFn;
+
+	static constexpr uint32_t kShopCost = joaat_hash("COST_SHOP_DEFAULT");
+	static constexpr uint32_t kCash = joaat_hash("CURRENCY_CASH");
+	static constexpr size_t kMaxCosts = 15;
+
+	struct CostEntry
+	{
+		uint64_t currency;
+		uint64_t amount;
+	};
+
+	struct AcquireCost
+	{
+		uint64_t fields[3];
+		uint64_t count;
+		uint64_t capacity;
+		CostEntry entries[kMaxCosts];
+		uint64_t additionalCount;
+		uint64_t additionalCapacity;
+	};
+	static_assert(sizeof(AcquireCost) == 37 * sizeof(uint64_t), "Acquire cost layout");
+
+	static CostEntry *FindCashEntry(AcquireCost &cost)
+	{
+		const uint32_t count = static_cast<uint32_t>(cost.count);
+		if (count > kMaxCosts) return nullptr;
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			if (static_cast<uint32_t>(cost.entries[i].currency) == kCash)
+				return &cost.entries[i];
+		}
+		return nullptr;
+	}
+
+	static bool GetLiveTable(GetScrProgramFn getProgram, uint32_t script,
+		scrNativeHandler *&table, uint32_t &count, uintptr_t *liveProgram = nullptr)
+	{
+		table = nullptr;
+		if (!getProgram) return false;
+
+		uintptr_t program = 0;
+		__try
+		{
+			program = reinterpret_cast<uintptr_t>(getProgram(script));
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+
+		if (liveProgram) *liveProgram = program;
+		uint32_t name = 0;
+		return program && Satchel_Read(program + 0x58, name) && name == script &&
+			Satchel_Read(program + 0x2C, count) && count > 0 && count <= 4096 &&
+			Satchel_Read(program + 0x40, table) && table &&
+			(reinterpret_cast<uintptr_t>(table) % alignof(scrNativeHandler) == 0);
+	}
+
+	static bool ExchangeSlot(scrNativeHandler *slot, scrNativeHandler from, scrNativeHandler to)
+	{
+		DWORD protection = 0;
+		if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return false;
+		const auto previous = InterlockedCompareExchangePointer(
+			reinterpret_cast<void *volatile *>(slot), reinterpret_cast<void *>(to),
+			reinterpret_cast<void *>(from));
+		DWORD ignored = 0;
+		VirtualProtect(slot, sizeof(*slot), protection, &ignored);
+		return previous == reinterpret_cast<void *>(from);
+	}
+}
+
+namespace Gunsmith
+{
+	using ShopScript::GetScrProgramFn;
+	using ShopScript::AcquireCost;
+	using ShopScript::CostEntry;
+	using ShopScript::kShopCost;
+	using ShopScript::kMaxCosts;
+	using ShopScript::FindCashEntry;
+	using ShopScript::ExchangeSlot;
+
+	static constexpr uint32_t kShopScript = joaat_hash("shop_gunsmith");
+	static constexpr uint32_t kEvans = joaat_hash("WEAPON_REPEATER_EVANS");
+	static constexpr uint32_t kEvansMission = 0x6C7F0A41;
+
+	static constexpr uint32_t kWeapons[] = {
+		joaat_hash("WEAPON_REVOLVER_CATTLEMAN"),
+		joaat_hash("WEAPON_REVOLVER_DOUBLEACTION"),
+		joaat_hash("WEAPON_REVOLVER_SCHOFIELD"),
+		joaat_hash("WEAPON_REVOLVER_LEMAT"),
+		joaat_hash("WEAPON_PISTOL_VOLCANIC"),
+		joaat_hash("WEAPON_PISTOL_SEMIAUTO"),
+		joaat_hash("WEAPON_PISTOL_MAUSER"),
+		joaat_hash("WEAPON_PISTOL_M1899"),
+		joaat_hash("WEAPON_REPEATER_CARBINE"),
+		joaat_hash("WEAPON_REPEATER_WINCHESTER"),
+		joaat_hash("WEAPON_REPEATER_HENRY"),
+		joaat_hash("WEAPON_REPEATER_EVANS"),
+		joaat_hash("WEAPON_RIFLE_VARMINT"),
+		joaat_hash("WEAPON_RIFLE_SPRINGFIELD"),
+		joaat_hash("WEAPON_RIFLE_BOLTACTION"),
+		joaat_hash("WEAPON_SNIPERRIFLE_ROLLINGBLOCK"),
+		joaat_hash("WEAPON_SNIPERRIFLE_CARCANO"),
+		joaat_hash("WEAPON_SHOTGUN_SAWEDOFF"),
+		joaat_hash("WEAPON_SHOTGUN_DOUBLEBARREL"),
+		joaat_hash("WEAPON_SHOTGUN_PUMP"),
+		joaat_hash("WEAPON_SHOTGUN_REPEATING"),
+		joaat_hash("WEAPON_SHOTGUN_SEMIAUTO"),
+	};
+
+	struct EditionWeapon
+	{
+		uint32_t modifier;
+		uint32_t item;
+	};
+
+	static constexpr EditionWeapon kEditionWeapons[] = {
+		{ static_cast<uint32_t>(-2026391750), joaat_hash("WEAPON_PISTOL_VOLCANIC") },
+		{ static_cast<uint32_t>(-2040758394), joaat_hash("WEAPON_SHOTGUN_PUMP") },
+		{ static_cast<uint32_t>(-2002058406), joaat_hash("WEAPON_RIFLE_VARMINT") },
+	};
+
+	static constexpr int kActiveShop = 1914319 + 16855;
+	static constexpr int kShopRecords = 1914319 + 3 + 1;
+	static constexpr int kShopRecordSize = 446;
+	static constexpr int kShopRecordCount = 35;
+	static constexpr int kBuyModifiersOffset = 35 + 141 + 1;
+	static constexpr int kBuyModifierSize = 7;
+	static constexpr int kBuyModifierCount = 20;
+	static constexpr uint32_t kItemModifier = 1;
+	static int s_editionModifierBase = 0;
+	static const EditionWeapon *s_editionModifiers[kBuyModifierCount] = {};
+
+	static bool RestoreEditionPrices()
+	{
+		bool restored = true;
+		for (int i = 0; i < kBuyModifierCount; ++i)
+		{
+			const EditionWeapon *weapon = s_editionModifiers[i];
+			if (!weapon) continue;
+			const int entry = s_editionModifierBase + i * kBuyModifierSize;
+			uint32_t id = 0, type = 0, item = 0;
+			if (!RdG(entry, id) || !RdG(entry + 1, type) || !RdG(entry + 2, item) ||
+				(id == weapon->modifier && type == kItemModifier && item == 0 && !WrG(entry + 2, weapon->item)))
+			{
+				restored = false;
+				continue;
+			}
+			s_editionModifiers[i] = nullptr;
+		}
+		if (restored) s_editionModifierBase = 0;
+		return restored;
+	}
+
+	static void UpdateEditionPrices(bool enabled)
+	{
+		int base = 0;
+		uint32_t shop = 0, thread = 0;
+		if (enabled && RdG(kActiveShop, shop) && shop < kShopRecordCount &&
+			RdG(kActiveShop + 2, thread) && thread && thread != UINT32_MAX &&
+			SCRIPT::_0x724CB89D35B283D0(thread) == kShopScript)
+			base = kShopRecords + static_cast<int>(shop) * kShopRecordSize + kBuyModifiersOffset;
+
+		if (base != s_editionModifierBase && !RestoreEditionPrices()) return;
+		if (!base) return;
+		s_editionModifierBase = base;
+		for (int i = 0; i < kBuyModifierCount; ++i)
+		{
+			const int entry = base + i * kBuyModifierSize;
+			uint32_t id = 0;
+			if (!RdG(entry, id)) continue;
+			for (const auto &weapon : kEditionWeapons)
+			{
+				if (id != weapon.modifier) continue;
+				uint32_t type = 0, item = 0, multiplier = 0;
+				if (RdG(entry + 1, type) && type == kItemModifier && RdG(entry + 2, item) &&
+					item == weapon.item && RdG(entry + 6, multiplier) && multiplier == 0 &&
+					WrG(entry + 2, 0))
+					s_editionModifiers[i] = &weapon;
+				break;
+			}
+		}
+	}
+
+	struct Hook
+	{
+		uint64_t hash;
+		scrNativeHandler replacement;
+		scrNativeHandler original;
+		scrNativeHandler *slot;
+	};
+
+	static void IsVisible(scrNativeCallContext *ctx);
+	static void FillCost(scrNativeCallContext *ctx);
+	static void FillStockRequirement(scrNativeCallContext *ctx);
+
+	enum NativeSlot { Visibility, CashCost, StockRequirement };
+	static Hook s_hooks[] = {
+		{ 0x8588A14B75AF096Bull, IsVisible, nullptr, nullptr },
+		{ 0x74F7928816E4E181ull, FillCost, nullptr, nullptr },
+		{ 0xE0EA5C031AE5539Full, FillStockRequirement, nullptr, nullptr },
+	};
+	static GetScrProgramFn s_getProgram = nullptr;
+	static scrNativeHandler *s_table = nullptr;
+	static scrNativeHandler *s_incompatibleTable = nullptr;
+	static uint32_t s_unlocks[_countof(kWeapons)] = {};
+	static bool s_active = false;
+	static int s_evansMissionStatus = 0;
+
+	static int FindEvansMissionStatus()
+	{
+		constexpr int missionTable = 1835011;
+		constexpr int missionStride = 74;
+		constexpr int statusTable = 12106;
+		constexpr int statusStride = 7;
+		uint32_t count = 0;
+		if (!RdG(missionTable, count) || count == 0 || count > 200) return 0;
+		for (uint32_t i = 0; i < count && i <= 80; ++i)
+		{
+			const int record = missionTable + 1 + static_cast<int>(i) * missionStride;
+			char name[32] = {};
+			if (!Satchel_Read(reinterpret_cast<uintptr_t>(getGlobalPtr(record + 8)), name, sizeof(name)) ||
+				!memchr(name, 0, sizeof(name)) || joaat_hash(name) != kEvansMission)
+				continue;
+			uint32_t mission = 0;
+			if (RdG(record + 1, mission) && mission > 0 && mission < 771)
+				return statusTable + 1 + static_cast<int>(mission) * statusStride + 1;
+		}
+		return 0;
+	}
+
+	static bool EvansMissionIncomplete()
+	{
+		uint32_t state = 0;
+		return s_evansMissionStatus && RdG(s_evansMissionStatus, state) && state < 5;
+	}
+
+	static bool ReadWeaponUnlocks()
+	{
+		bool found = false;
+		for (size_t i = 0; i < _countof(kWeapons); ++i)
+		{
+			s_unlocks[i] = 0;
+			AcquireCost cost = {};
+			cost.capacity = kMaxCosts;
+			cost.additionalCapacity = 10;
+			if (!ITEMDATABASE::_0x74F7928816E4E181(kWeapons[i], kShopCost, reinterpret_cast<Any *>(&cost)))
+				continue;
+			const CostEntry *cash = FindCashEntry(cost);
+			if (!cash || static_cast<int32_t>(cash->amount) <= 0) continue;
+			s_unlocks[i] = WEAPON::_0x865F36299079FB75(kWeapons[i]);
+			found = found || s_unlocks[i] != 0;
+		}
+		return found;
+	}
+
+	static void IsVisible(scrNativeCallContext *ctx)
+	{
+		const uint32_t unlock = ctx->GetArg<uint32_t>(0);
+		s_hooks[Visibility].original(ctx);
+		if (!s_active || !g_gunsmithUnlocker || !unlock) return;
+		for (uint32_t candidate : s_unlocks)
+		{
+			if (candidate != unlock) continue;
+			*static_cast<uint32_t *>(ctx->m_ReturnValue) = TRUE;
+			return;
+		}
+	}
+
+	static bool IsNaturallyVisible(uint32_t unlock)
+	{
+		uint64_t arg = unlock;
+		uint64_t result = 0;
+		scrNativeCallContext ctx = {};
+		ctx.m_Args = &arg;
+		ctx.m_ArgCount = 1;
+		ctx.m_ReturnValue = &result;
+		s_hooks[Visibility].original(&ctx);
+		return static_cast<uint32_t>(result) != 0;
+	}
+
+	static void FillCost(scrNativeCallContext *ctx)
+	{
+		const uint32_t item = ctx->GetArg<uint32_t>(0);
+		const uint32_t costType = ctx->GetArg<uint32_t>(1);
+		auto *cost = ctx->GetArg<AcquireCost *>(2);
+		s_hooks[CashCost].original(ctx);
+		if (!s_active || !g_gunsmithUnlocker || costType != kShopCost || !cost ||
+			!*static_cast<const uint32_t *>(ctx->m_ReturnValue))
+			return;
+
+		for (size_t i = 0; i < _countof(kWeapons); ++i)
+		{
+			const uint32_t unlock = s_unlocks[i];
+			if (kWeapons[i] != item || !unlock) continue;
+			CostEntry *cash = FindCashEntry(*cost);
+			if (!cash) return;
+			const int32_t amount = static_cast<int32_t>(cash->amount);
+			if (amount > 0 && amount <= INT32_MAX / 2 &&
+				(!IsNaturallyVisible(unlock) || (item == kEvans && EvansMissionIncomplete())))
+				cash->amount = (cash->amount & 0xFFFFFFFF00000000ull) | static_cast<uint32_t>(amount * 2);
+			return;
+		}
+	}
+
+	static void FillStockRequirement(scrNativeCallContext *ctx)
+	{
+		const uint32_t item = ctx->GetArg<uint32_t>(1);
+		auto *rule = ctx->GetArg<uint64_t *>(4);
+		s_hooks[StockRequirement].original(ctx);
+		if (!s_active || !g_gunsmithUnlocker || !rule ||
+			!*static_cast<const uint32_t *>(ctx->m_ReturnValue) || rule[2] != 1)
+			return;
+
+		if (item != kEvans || rule[0] != joaat_hash("INV_REQ_TYPE_MISSION_COMPLETE") ||
+			rule[1] != kEvansMission || !EvansMissionIncomplete())
+			return;
+		for (size_t i = 0; i < _countof(kWeapons); ++i)
+		{
+			if (kWeapons[i] != item || !s_unlocks[i]) continue;
+			rule[0] = joaat_hash("INV_REQ_TYPE_WEAPON_UNLOCKED_FOR_PURCHASE");
+			rule[1] = item;
+			return;
+		}
+	}
+
+	static bool Restore(scrNativeHandler *liveTable)
+	{
+		s_active = false;
+		bool restored = true;
+		for (Hook &hook : s_hooks)
+		{
+			if (!hook.slot) continue;
+			if (liveTable && liveTable == s_table)
+			{
+				scrNativeHandler current = nullptr;
+				if (!Satchel_Read(reinterpret_cast<uintptr_t>(hook.slot), current) ||
+					(current == hook.replacement && !ExchangeSlot(hook.slot, hook.replacement, hook.original)))
+				{
+					restored = false;
+					continue;
+				}
+			}
+			hook.slot = nullptr;
+		}
+		if (restored) s_table = nullptr;
+		return restored;
+	}
+
+	static bool FindSlots(scrNativeHandler *table, uint32_t count, scrNativeHandler **slots)
+	{
+		const GetNativeHandlerFn lookup = ResolveNativeHandlerLookup();
+		if (!lookup) return false;
+		vector<scrNativeHandler> entries(count);
+		if (!Satchel_Read(reinterpret_cast<uintptr_t>(table), entries.data(), entries.size() * sizeof(entries[0])))
+			return false;
+
+		for (size_t i = 0; i < _countof(s_hooks); ++i)
+		{
+			Hook &hook = s_hooks[i];
+			hook.original = lookup(hook.hash);
+			if (!hook.original) return false;
+			for (size_t j = 0; j < entries.size(); ++j)
+			{
+				if (entries[j] != hook.original) continue;
+				if (slots[i]) return false;
+				slots[i] = &table[j];
+			}
+			if (!slots[i]) return false;
+			for (size_t j = 0; j < i; ++j)
+				if (slots[i] == slots[j]) return false;
+		}
+		return true;
+	}
+
+	static void Tick()
+	{
+		const bool enabled = g_gunsmithUnlocker &&
+			!NETWORK::NETWORK_IS_SESSION_ACTIVE() && !NETWORK::NETWORK_IS_GAME_IN_PROGRESS();
+		UpdateEditionPrices(enabled);
+		if (!g_gunsmithUnlocker && !s_table)
+		{
+			s_incompatibleTable = nullptr;
+			return;
+		}
+		static DWORD last = 0;
+		const DWORD now = GetTickCount();
+		if (now - last < 250) return;
+		last = now;
+
+		if (enabled && !s_getProgram)
+		{
+			static const GetScrProgramFn getProgram = StoryHorseRename::ResolveGetProgram();
+			s_getProgram = getProgram;
+			if (!s_getProgram) return;
+		}
+
+		scrNativeHandler *liveTable = nullptr;
+		uint32_t count = 0;
+		if (!ShopScript::GetLiveTable(s_getProgram, kShopScript, liveTable, count)) liveTable = nullptr;
+		if (!enabled || s_incompatibleTable != liveTable) s_incompatibleTable = nullptr;
+		if (s_active && enabled && liveTable == s_table) return;
+		if (s_table && !Restore(liveTable)) return;
+		if (!enabled || !liveTable || liveTable == s_incompatibleTable) return;
+
+		scrNativeHandler *slots[_countof(s_hooks)] = {};
+		if (!FindSlots(liveTable, count, slots))
+		{
+			s_incompatibleTable = liveTable;
+			OutputDebugStringA("[Dreamaker] Gunsmith native table not recognized.\n");
+			return;
+		}
+		if (!ReadWeaponUnlocks()) return;
+		s_evansMissionStatus = FindEvansMissionStatus();
+
+		s_table = liveTable;
+		for (size_t i = 0; i < _countof(s_hooks); ++i)
+		{
+			Hook &hook = s_hooks[i];
+			if (!ExchangeSlot(slots[i], hook.original, hook.replacement))
+			{
+				Restore(liveTable);
+				s_incompatibleTable = liveTable;
+				OutputDebugStringA("[Dreamaker] Could not install gunsmith native hooks.\n");
+				return;
+			}
+			hook.slot = slots[i];
+		}
+		s_active = true;
+	}
+
+	static void Shutdown()
+	{
+		RestoreEditionPrices();
+		if (!s_table) return;
+		scrNativeHandler *liveTable = nullptr;
+		uint32_t count = 0;
+		Restore(ShopScript::GetLiveTable(s_getProgram, kShopScript, liveTable, count) ? liveTable : nullptr);
+	}
+}
+
+namespace Tailor
+{
+	using StoryHorseRename::GetScrProgramFn;
+
+	static constexpr uint32_t kTailorScript = joaat_hash("shop_tailor");
+	static constexpr uint32_t kGeneralScript = joaat_hash("shop_general");
+	static constexpr uint32_t kClothingStock = joaat_hash("ST_CLOTHING");
+	static constexpr uint32_t kInShop = joaat_hash("INV_REQ_TYPE_IN_SHOP");
+	static constexpr uint32_t kStoryMode = joaat_hash("INV_REQ_TYPE_SP");
+	static constexpr uint32_t kClothing = joaat_hash("CLOTHING");
+	static constexpr uint32_t kOutfit = joaat_hash("CI_CATEGORY_WARDROBE_OUTFIT");
+
+	struct StoreOutfit
+	{
+		uint32_t item;
+		uint32_t style;
+		int minimumHonor;
+		uint32_t shop;
+	};
+
+	static constexpr StoreOutfit kStoreOutfits[] = {
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_RHDSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_RHDSHOP_001_H"), 120, 28 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_RHDSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_RHDSHOP_002_H"), 240, 28 },
+		{ joaat_hash("CLOTHING_OUTFIT_AMDSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_AMDSHOP_001_H"), 120, 95 },
+		{ joaat_hash("CLOTHING_OUTFIT_AMDSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_AMDSHOP_002_H"), 240, 95 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_VALSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_VALSHOP_001_H"), 120, 74 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_VALSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_VALSHOP_002_H"), 240, 74 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_WALSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_WALSHOP_001_H"), 120, 87 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_WALSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_WALSHOP_002_H"), 240, 87 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_TBLSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_TBLSHOP_001_H"), 120, 90 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_TBLSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_TBLSHOP_002_H"), 240, 90 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_STRSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_STRSHOP_001_H"), 120, 61 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_STRSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_STRSHOP_002_H"), 240, 61 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_SDSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_SDSHOP_001_H"), 120, 47 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_SDSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_SDSHOP_002_H"), 240, 47 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_BLCKSHOP_001_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_BLCKSHOP_001_H"), 120, 17 },
+		{ joaat_hash("CLOTHING_OUTFIT_NEW_BLCKSHOP_002_H"), joaat_hash("CLOTHING_STYLE_OUTFIT_NEW_BLCKSHOP_002_H"), 240, 17 },
+	};
+
+	struct PricePatch
+	{
+		uint8_t *address = nullptr;
+		size_t size = 0;
+		uint8_t original[8] = {};
+		uint8_t replacement[8] = {};
+	};
+
+	template<uint32_t Script>
+	struct OutfitShop
+	{
+		static constexpr bool kIsTailor = Script == kTailorScript;
+
+		static OutfitShop &Instance()
+		{
+			static OutfitShop instance;
+			return instance;
+		}
+
+		static void RoundOutfitPrice(scrNativeCallContext *ctx)
+		{
+			Instance().HandleRoundPrice(ctx);
+		}
+
+		static void FillStockRequirement(scrNativeCallContext *ctx)
+		{
+			Instance().HandleStockRequirement(ctx);
+		}
+
+		GetScrProgramFn s_getProgram = nullptr;
+		uint32_t s_programHash = Script;
+		scrNativeHandler s_round = nullptr;
+		scrNativeHandler s_isUnlocked = nullptr;
+		scrNativeHandler *s_roundSlot = nullptr;
+		PricePatch s_price;
+		bool s_multiplierFirst = false;
+		scrNativeHandler s_original = nullptr;
+		scrNativeHandler s_itemInfo = nullptr;
+		scrNativeHandler s_itemCost = nullptr;
+		scrNativeHandler *s_table = nullptr;
+		vector<scrNativeHandler *> s_stockSlots;
+		scrNativeHandler *s_incompatible = nullptr;
+		bool s_active = false;
+
+		static bool IsTailor(uint32_t shop)
+		{
+			return shop == 17 || shop == 47;
+		}
+
+		static uint32_t ActiveShop()
+		{
+			uint32_t shop = 0;
+			if (!RdG(1914319 + 16855 + 1, shop) || IsTailor(shop) != kIsTailor) return 0;
+			return shop;
+		}
+
+		static const StoreOutfit *FindStoreOutfit(uint32_t item, uint32_t shop)
+		{
+			for (const auto &outfit : kStoreOutfits)
+				if (outfit.shop == shop && (outfit.item == item || outfit.style == item)) return &outfit;
+			return nullptr;
+		}
+
+		static bool Query(scrNativeHandler handler, uint64_t *args, uint32_t count)
+		{
+			uint64_t result = 0;
+			scrNativeCallContext ctx = {};
+			ctx.m_ReturnValue = &result;
+			ctx.m_ArgCount = count;
+			ctx.m_Args = args;
+			handler(&ctx);
+			return static_cast<uint32_t>(result) != 0;
+		}
+
+		bool NeedsHonorPremium(const StoreOutfit &outfit, bool &required)
+		{
+			required = false;
+			if (!s_isUnlocked) return false;
+
+			uint64_t arg = outfit.item;
+			if (Query(s_isUnlocked, &arg, 1)) return true;
+
+			uint32_t honor = 0;
+			if (!RdG(40 + 11095 + 35, honor)) return false;
+			required = static_cast<int32_t>(honor) < outfit.minimumHonor;
+			return true;
+		}
+
+		void HandleRoundPrice(scrNativeCallContext *ctx)
+		{
+			if (ctx->m_ArgCount != 3)
+			{
+				s_round(ctx);
+				return;
+			}
+
+			const int32_t base = ctx->GetArg<int32_t>(s_multiplierFirst ? 1 : 0);
+			const float multiplier = ctx->GetArg<float>(s_multiplierFirst ? 0 : 1);
+			const uint32_t item = ctx->GetArg<uint32_t>(2);
+			const float total = static_cast<float>(base) * multiplier;
+			uint64_t arg = 0;
+			memcpy(&arg, &total, sizeof(total));
+			scrNativeCallContext round = {};
+			round.m_ReturnValue = ctx->m_ReturnValue;
+			round.m_ArgCount = 1;
+			round.m_Args = &arg;
+			s_round(&round);
+
+			if (!g_tailorUnlocker || !s_active || !s_price.address) return;
+			const StoreOutfit *outfit = FindStoreOutfit(item, ActiveShop());
+			bool premium = false;
+			if (!outfit || !NeedsHonorPremium(*outfit, premium) || !premium) return;
+			auto *amount = static_cast<int32_t *>(ctx->m_ReturnValue);
+			if (*amount > 0 && *amount <= INT32_MAX / 2) *amount *= 2;
+		}
+
+		bool FindPricePatch(const vector<uint8_t> &code, const vector<scrNativeHandler> &entries,
+			PricePatch &patch, uint32_t &offset, size_t &nativeIndex, bool &multiplierFirst)
+		{
+			bool found = false;
+			for (uint32_t pos = 0; pos + 22 <= code.size(); ++pos)
+			{
+				const auto *p = code.data() + pos;
+				if (p[0] != 0x66 || p[1] != 0 || p[2] != 0x37 ||
+					StoryHorseRename::ReadOperand(p + 3) != ShopScript::kShopCost)
+					continue;
+				unsigned call = 7;
+				if (p[call] == 0x6F && p[call + 1] == 1 && p[call + 2] == 0)
+					call += 3;
+				else
+				{
+					if (p[call] == 0x09) ++call;
+					else if (!kIsTailor && p[call] == 0x6D && p[call + 1] == 1) call += 2;
+					else continue;
+
+					if (p[call] == 0x2F) ++call;
+					else if (!kIsTailor && p[call] == 0x6D && p[call + 1] == 0) call += 2;
+					else continue;
+				}
+				if (p[call] != 0x66 || p[call + 1] != 1 || p[call + 2] != 0x39) continue;
+				call += 2;
+				const uint32_t target = uint32_t(p[call + 1]) | (uint32_t(p[call + 2]) << 8) |
+					(uint32_t(p[call + 3]) << 16);
+				if (target + 2 > code.size() || code[target] != 0x22 || code[target + 1] != 5)
+					continue;
+				unsigned start = call + 4;
+				if (pos + start + 8 > code.size() || p[start] != 0x36) continue;
+				const bool first = p[start + 1] == 0x24;
+				if (first && (pos < 2 || p[-2] != 0x66)) continue;
+				if (!first && (p[start + 1] != 0x66 || p[start + 3] != 0x24)) continue;
+				const uint8_t multiplierSlot = first ? p[-1] : p[start + 2];
+				if (kIsTailor ? multiplierSlot != 4 : (multiplierSlot < 4 || multiplierSlot > 6)) continue;
+				const unsigned native = start + (first ? 2 : 4);
+				if (p[native] != 0x03 || p[native + 1] != 5) continue;
+				const size_t le = p[native + 2] | (size_t(p[native + 3]) << 8);
+				const size_t be = p[native + 3] | (size_t(p[native + 2]) << 8);
+				const size_t index = le < entries.size() && entries[le] == s_round ? le : be;
+				if (index >= entries.size() || entries[index] != s_round) continue;
+
+				unsigned end = native + 4;
+				if (pos + end + 7 > code.size()) continue;
+				if (p[end] == 0x67 && p[end + 2] == 0x66 && p[end + 1] == p[end + 3]) end += 4;
+				if (p[end] != 0x50 || p[end + 1] != 2 || p[end + 2] != 1) continue;
+				if (found) return false;
+
+				patch.size = native + 4 - start;
+				memcpy(patch.original, p + start, patch.size);
+				memcpy(patch.replacement, patch.original, patch.size);
+				patch.replacement[0] = 0x66;
+				patch.replacement[1] = first ? 0 : p[start + 2];
+				if (!first)
+				{
+					patch.replacement[2] = 0x66;
+					patch.replacement[3] = 0;
+				}
+				patch.replacement[native + 1 - start] = 13;
+				offset = pos + start;
+				nativeIndex = index;
+				multiplierFirst = first;
+				found = true;
+			}
+			return found;
+		}
+
+		static bool WritePricePatch(const PricePatch &patch, bool restore)
+		{
+			const uint8_t *from = restore ? patch.replacement : patch.original;
+			const uint8_t *to = restore ? patch.original : patch.replacement;
+			uint8_t current[8] = {};
+			if (!Satchel_Read(reinterpret_cast<uintptr_t>(patch.address), current, patch.size)) return false;
+			if (memcmp(current, to, patch.size) == 0) return true;
+			if (memcmp(current, from, patch.size) != 0) return false;
+			DWORD protect = 0, ignored = 0;
+			if (!VirtualProtect(patch.address, patch.size, PAGE_READWRITE, &protect)) return false;
+			memcpy(patch.address, to, patch.size);
+			VirtualProtect(patch.address, patch.size, protect, &ignored);
+			return true;
+		}
+
+		void InstallOutfitPrice(uintptr_t program, scrNativeHandler *table,
+			const vector<scrNativeHandler> &entries)
+		{
+			uintptr_t pageTable = 0;
+			uint32_t size = 0;
+			if (!s_round || !Satchel_Read(program + 0x10, pageTable) || !pageTable ||
+				!Satchel_Read(program + 0x1C, size) || size < 0x1000 || size > 0x400000)
+				return;
+
+			vector<uint8_t *> pages((size + 0x3FFF) >> 14);
+			if (!Satchel_Read(pageTable, pages.data(), pages.size() * sizeof(pages[0]))) return;
+			vector<uint8_t> code(size);
+			for (size_t i = 0; i < pages.size(); ++i)
+			{
+				const size_t offset = i << 14;
+				const size_t length = size - offset < 0x4000 ? size - offset : 0x4000;
+				if (!pages[i] || !Satchel_Read(reinterpret_cast<uintptr_t>(pages[i]), code.data() + offset, length))
+					return;
+			}
+
+			PricePatch patch = {};
+			uint32_t offset = 0;
+			size_t index = 0;
+			bool first = false;
+			if (!FindPricePatch(code, entries, patch, offset, index, first) ||
+				(offset & 0x3FFF) + patch.size > 0x4000)
+				return;
+
+			patch.address = StoryHorseRename::CodePtr(pages.data(), size, offset);
+			if (!patch.address || !ShopScript::ExchangeSlot(&table[index], s_round, RoundOutfitPrice)) return;
+			s_roundSlot = &table[index];
+			s_multiplierFirst = first;
+			if (WritePricePatch(patch, false)) s_price = patch;
+			else if (ShopScript::ExchangeSlot(s_roundSlot, RoundOutfitPrice, s_round))
+				s_roundSlot = nullptr;
+		}
+
+		bool IsRetailGarment(uint32_t item)
+		{
+			uint64_t info[6] = {};
+			uint64_t itemArgs[] = { item, reinterpret_cast<uintptr_t>(info) };
+			if (!Query(s_itemInfo, itemArgs, _countof(itemArgs)) ||
+				info[2] != kClothing || info[1] == kOutfit)
+				return false;
+
+			ShopScript::AcquireCost cost = {};
+			cost.capacity = ShopScript::kMaxCosts;
+			cost.additionalCapacity = 10;
+			uint64_t costArgs[] = { item, ShopScript::kShopCost, reinterpret_cast<uintptr_t>(&cost) };
+			if (!Query(s_itemCost, costArgs, _countof(costArgs))) return false;
+			const auto *cash = ShopScript::FindCashEntry(cost);
+			return cash && static_cast<int32_t>(cash->amount) > 0;
+		}
+
+		void HandleStockRequirement(scrNativeCallContext *ctx)
+		{
+			if (ctx->m_ArgCount != 5)
+			{
+				s_original(ctx);
+				return;
+			}
+			const uint32_t stock = ctx->GetArg<uint32_t>(0);
+			const uint32_t item = ctx->GetArg<uint32_t>(1);
+			auto *rule = ctx->GetArg<uint64_t *>(4);
+			s_original(ctx);
+
+			constexpr uint32_t mainStock = kIsTailor ? joaat_hash("ST_TAILOR") : joaat_hash("ST_GENERAL");
+			if (!g_tailorUnlocker || !s_active || (stock != kClothingStock && stock != mainStock) ||
+				!item || !rule || !*static_cast<const uint32_t *>(ctx->m_ReturnValue) || rule[2] != 1)
+				return;
+			const uint32_t shop = ActiveShop();
+			if (!shop) return;
+
+			if (rule[0] == kInShop)
+			{
+				if (!kIsTailor || stock != kClothingStock ||
+					rule[1] == (shop == 17 ? joaat_hash("SHOP_BLK_TAILOR") : joaat_hash("SHOP_SDN_TAILOR")) ||
+					!IsRetailGarment(item))
+					return;
+			}
+			else
+			{
+				const StoreOutfit *outfit = FindStoreOutfit(item, shop);
+				if (!s_price.address || !outfit) return;
+				const uint32_t expectedHonor = outfit->minimumHonor == 120 ?
+					joaat_hash("SHOP_HONOR_LOW") : joaat_hash("SHOP_HONOR_HIGH");
+				constexpr uint32_t honorRule = joaat_hash("INV_REQ_TYPE_HONOR_LEVEL_UNLOCKED");
+				constexpr uint32_t ownUnlockRule = joaat_hash("INV_REQ_TYPE_UNLOCK");
+				if ((rule[0] != honorRule || rule[1] != expectedHonor) &&
+					(rule[0] != ownUnlockRule || rule[1] != outfit->item))
+					return;
+				bool premium = false;
+				if (!NeedsHonorPremium(*outfit, premium) || !premium) return;
+			}
+
+			rule[0] = kStoryMode;
+			rule[1] = 0;
+		}
+
+		bool Restore(scrNativeHandler *liveTable)
+		{
+			s_active = false;
+			if (liveTable && liveTable == s_table)
+			{
+				for (auto *slot : s_stockSlots)
+				{
+					scrNativeHandler current = nullptr;
+					if (!Satchel_Read(reinterpret_cast<uintptr_t>(slot), current) ||
+						(current == FillStockRequirement && !ShopScript::ExchangeSlot(slot, current, s_original)))
+						return false;
+				}
+			}
+			if (liveTable && liveTable == s_table)
+			{
+				if (s_price.address && !WritePricePatch(s_price, true)) return false;
+				s_price = {};
+				if (s_roundSlot)
+				{
+					scrNativeHandler current = nullptr;
+					if (!Satchel_Read(reinterpret_cast<uintptr_t>(s_roundSlot), current) ||
+						(current == RoundOutfitPrice && !ShopScript::ExchangeSlot(s_roundSlot, current, s_round)))
+						return false;
+				}
+			}
+			s_price = {};
+			s_roundSlot = nullptr;
+			s_table = nullptr;
+			s_stockSlots.clear();
+			return true;
+		}
+
+		bool Install(uintptr_t program, scrNativeHandler *table, uint32_t count)
+		{
+			const GetNativeHandlerFn lookup = ResolveNativeHandlerLookup();
+			if (!lookup) return false;
+			s_round = lookup(0xF2DB717A73826179ull);
+			s_isUnlocked = lookup(0xC4B660C7B6040E75ull);
+			s_original = lookup(0xE0EA5C031AE5539Full);
+			if (!s_original) return false;
+			if (kIsTailor)
+			{
+				s_itemInfo = lookup(0xFE90ABBCBFDC13B2ull);
+				s_itemCost = lookup(0x74F7928816E4E181ull);
+				if (!s_itemInfo || !s_itemCost) return false;
+			}
+
+			vector<scrNativeHandler> entries(count);
+			if (!Satchel_Read(reinterpret_cast<uintptr_t>(table), entries.data(), entries.size() * sizeof(entries[0])))
+				return false;
+			vector<scrNativeHandler *> slots;
+			for (size_t i = 0; i < entries.size(); ++i)
+				if (entries[i] == s_original) slots.push_back(&table[i]);
+			if (slots.empty()) return false;
+
+			s_stockSlots.reserve(slots.size());
+			s_table = table;
+			for (auto *slot : slots)
+			{
+				if (!ShopScript::ExchangeSlot(slot, s_original, FillStockRequirement))
+				{
+					Restore(table);
+					return false;
+				}
+				s_stockSlots.push_back(slot);
+			}
+			InstallOutfitPrice(program, table, entries);
+			if (!s_price.address)
+				OutputDebugStringA("[Dreamaker] Outfit shop price code not recognized. Early outfit purchases unavailable.\n");
+			s_active = true;
+			return true;
+		}
+
+		static uint32_t GeneralStoreProgram()
+		{
+			const uint32_t shop = ActiveShop();
+			bool sellsOutfits = false;
+			for (const auto &outfit : kStoreOutfits)
+			{
+				if (outfit.shop != shop) continue;
+				sellsOutfits = true;
+				break;
+			}
+			if (!sellsOutfits) return kGeneralScript;
+
+			uint32_t thread = 0;
+			if (!RdG(1914319 + 16855 + 2, thread) || !thread || thread == UINT32_MAX)
+				return kGeneralScript;
+			const uint32_t script = SCRIPT::_0x724CB89D35B283D0(thread);
+			return script && script != UINT32_MAX && script != kTailorScript && script != joaat_hash("shop_gunsmith") ?
+				script : kGeneralScript;
+		}
+
+		void Tick()
+		{
+			if (!g_tailorUnlocker && !s_table)
+			{
+				s_incompatible = nullptr;
+				return;
+			}
+
+			static DWORD last = 0;
+			const DWORD now = GetTickCount();
+			if (now - last < 100) return;
+			last = now;
+
+			const bool enabled = g_tailorUnlocker &&
+				!NETWORK::NETWORK_IS_SESSION_ACTIVE() && !NETWORK::NETWORK_IS_GAME_IN_PROGRESS();
+			if (enabled && !s_getProgram)
+			{
+				static const auto getProgram = StoryHorseRename::ResolveGetProgram();
+				s_getProgram = getProgram;
+				if (!s_getProgram) return;
+			}
+
+			scrNativeHandler *table = nullptr;
+			uint32_t count = 0;
+			uintptr_t program = 0;
+			const uint32_t script = enabled && !kIsTailor ? GeneralStoreProgram() : s_programHash;
+			if (script != s_programHash)
+			{
+				if (s_table)
+				{
+					if (!ShopScript::GetLiveTable(s_getProgram, s_programHash, table, count)) table = nullptr;
+					if (!Restore(table)) return;
+				}
+				s_incompatible = nullptr;
+				s_programHash = script;
+			}
+			if (!ShopScript::GetLiveTable(s_getProgram, s_programHash, table, count, &program)) table = nullptr;
+			if (!enabled || s_incompatible != table) s_incompatible = nullptr;
+			if (s_active && enabled && s_table == table) return;
+			if (s_table && !Restore(table)) return;
+			if (!enabled || !table || table == s_incompatible) return;
+
+			if (!Install(program, table, count))
+			{
+				s_incompatible = table;
+				OutputDebugStringA("[Dreamaker] Outfit shop stock native table not recognized.\n");
+			}
+		}
+
+		void Shutdown()
+		{
+			if (!s_table) return;
+			scrNativeHandler *table = nullptr;
+			uint32_t count = 0;
+			if (!ShopScript::GetLiveTable(s_getProgram, s_programHash, table, count)) table = nullptr;
+			Restore(table);
+		}
+	};
+
+	static void Tick()
+	{
+		OutfitShop<kTailorScript>::Instance().Tick();
+		OutfitShop<kGeneralScript>::Instance().Tick();
+	}
+
+	static void Shutdown()
+	{
+		OutfitShop<kTailorScript>::Instance().Shutdown();
+		OutfitShop<kGeneralScript>::Instance().Shutdown();
+	}
+}
